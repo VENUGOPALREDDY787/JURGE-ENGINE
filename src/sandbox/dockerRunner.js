@@ -10,12 +10,11 @@ const config = require("../config");
 
 const LANGUAGE_CONFIG = {
 java: {
-  image: "eclipse-temurin:21",
-    file: "Main.java",
-    compile: "javac Main.java",
-    run: "java Main",
-  },
-
+  image: "judge-java-nsjail",
+  file: "Main.java",
+  compile: "javac Main.java",
+  run: "/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- /opt/java/openjdk/bin/java Main",
+},
   python: {
     image: "python:3.12",
     file: "main.py",
@@ -24,10 +23,10 @@ java: {
   },
 
   javascript: {
-    image: "node:20",
+    image: "judge-node-nsjail",
     file: "index.js",
     compile: "",
-    run: "node index.js",
+   run: "/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- /usr/local/bin/node /workspace/index.js"
   },
 
   c: {
@@ -38,11 +37,11 @@ java: {
   },
 
   cpp: {
-    image: "gcc:12",
-    file: "main.cpp",
-    compile: "g++ main.cpp -o main",
-    run: "./main",
-  },
+  image: "judge-cpp-nsjail",
+  file: "main.cpp",
+  compile: "g++ main.cpp -o main",
+  run: "/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- ./main",
+},
 
   go: {
     image: "golang:1.22",
@@ -52,7 +51,7 @@ java: {
   },
 };
 
-async function runSandbox({ language, sourceCode }) {
+async function runSandbox({ language, sourceCode ,stdin}) {
   const lang = LANGUAGE_CONFIG[language];
 
   if (!lang) {
@@ -63,75 +62,102 @@ async function runSandbox({ language, sourceCode }) {
     path.join(os.tmpdir(), "exec-")
   );
 
-  try {
-    const sourceFile = path.join(tmpDir, lang.file);
+const startTime = Date.now();
 
-    await fs.writeFile(
-      sourceFile,
-      sourceCode,
-      "utf8"
-    );
+try {
 
-    let innerCommand = "";
+  const sourceFile = path.join(tmpDir, lang.file);
 
-    if (lang.compile) {
-      innerCommand =
-        `${lang.compile} && ${lang.run}`;
-    } else {
-      innerCommand = lang.run;
-    }
+  await fs.writeFile(
+    sourceFile,
+    sourceCode,
+    "utf8"
+  );
 
-    const dockerCommand = [
-      "docker run --rm",
-      `--memory=${config.sandbox.memory || "256m"}`,
-      `--cpus=${config.sandbox.cpu || "0.5"}`,
-      "--network none",
-      `-v "${tmpDir}:/workspace"`,
-      "-w /workspace",
-      lang.image,
-      `sh -c "${innerCommand}"`,
-    ].join(" ");
+  let innerCommand = "";
 
-    console.log("\n=== Docker Command ===");
-    console.log(dockerCommand);
-    console.log("======================\n");
+  if (lang.compile) {
+    innerCommand =
+      `${lang.compile} && ${lang.run}`;
+  } else {
+    innerCommand = lang.run;
+  }
+const escapedInput = (stdin || "")
+  .replace(/"/g, '\\"')
+  .replace(/\n/g, '\\n');
+  const dockerCommand = [
+    `echo "${escapedInput}" |`,
+    "docker run --rm",
+    "--privileged",
+    `--memory=${config.sandbox.memory || "256m"}`,
+    `--cpus=${config.sandbox.cpu || "0.5"}`,
+    "--network none",
+    `-v "${tmpDir}:/workspace"`,
+    "-w /workspace",
+    lang.image,
+    `sh -c "${innerCommand}"`,
+  ].join(" ");
 
-    const { stdout, stderr } =
-      await execAsync(dockerCommand, {
-        timeout:
-          (config.sandbox.timeoutMs || 5000) + 2000,
-      });
+  console.log("\n=== Docker Command ===");
+  console.log("STDIN:", JSON.stringify(stdin));
+  console.log(dockerCommand);
+  console.log("======================\n");
 
-    return {
-      stdout,
-      stderr,
-      compileOutput: "",
-      verdict:
-        stderr && stderr.length > 0
-          ? "Runtime Error"
-          : "Accepted",
-      timeMs: 0,
-      memory: 0,
-    };
-  }catch (err) {
+  const { stdout, stderr } =
+    await execAsync(dockerCommand, {
+      timeout:
+        (config.sandbox.timeoutMs || 5000) + 2000,
+    });
+
+  const executionTime = Date.now() - startTime;
+
+  return {
+    stdout,
+    stderr,
+    compileOutput: "",
+    verdict: "Accepted",
+    timeMs: executionTime,
+    memory: 0,
+  };
+
+} catch (err) {
+  const executionTime = Date.now() - startTime;
+
+  let verdict = "Runtime Error";
+
+  if (err.killed) {
+    verdict = "Time Limit Exceeded";
+    err.stdout = "";
+    err.stderr = "Time Limit Exceeded";;
+  }
+
+  if (err.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+    verdict = "Output Limit Exceeded";
+    err.stdout = "";
+    err.stderr = "Output limit exceeded";
+  }
+
   return {
     stdout: err.stdout || "",
     stderr: err.stderr || err.message,
     compileOutput: "",
-    verdict: "Runtime Error",
-    timeMs: 0,
+    verdict,
+    timeMs: executionTime,
     memory: 0,
   };
-} finally {
-    try {
-      await fs.rm(tmpDir, {
-        recursive: true,
-        force: true,
-      });
-    } catch (e) {}
-  }
+}
+finally {
+
+  try {
+    await fs.rm(tmpDir, {
+      recursive: true,
+      force: true,
+    });
+  } catch (e) {}
+}
 }
 
 module.exports = {
   runSandbox,
-};
+}
+
