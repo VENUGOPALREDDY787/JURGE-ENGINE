@@ -1,85 +1,119 @@
-const fs = require('fs').promises;
-const os = require('os');
-const path = require('path');
-const config = require('../config');
+﻿const config = require('../config');
 const containerManager = require('./containerManager');
 
 const LANGUAGE_CONFIG = {
-  java: { image: 'judge-java-nsjail', file: 'Main.java', compile: 'javac Main.java', run: '/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- /opt/java/openjdk/bin/java Main' },
-  python: { image: 'judge-python-nsjail', file: 'main.py', compile: '', run: '/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- python main.py' },
-  javascript: { image: 'judge-node-nsjail', file: 'index.js', compile: '', run: '/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- /usr/local/bin/node /workspace/index.js' },
-  c: { image: 'judge-c-nsjail', file: 'main.c', compile: 'gcc main.c -o main', run: '/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- ./main' },
-  cpp: { image: 'judge-cpp-nsjail', file: 'main.cpp', compile: 'g++ main.cpp -o main', run: '/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- ./main' },
-  go: { image: 'judge-go-nsjail', file: 'main.go', compile: 'go build -o main main.go', run: '/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- ./main' }
+  java: {
+    file: 'Main.java',
+    compile: 'javac Main.java',
+    run: '/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- /opt/java/openjdk/bin/java Main'
+  },
+  python: {
+    file: 'main.py',
+    compile: '',
+    run: '/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- python main.py'
+  },
+  javascript: {
+    file: 'index.js',
+    compile: '',
+    run: '/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- /usr/local/bin/node /workspace/index.js'
+  },
+  c: {
+    file: 'main.c',
+    compile: 'gcc main.c -o main',
+    run: '/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- ./main'
+  },
+  cpp: {
+    file: 'main.cpp',
+    compile: 'g++ main.cpp -o main main.cpp',
+    run: '/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- ./main'
+  },
+  go: {
+    file: 'main.go',
+    compile: 'go build -o main main.go',
+    run: '/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- ./main'
+  }
 };
+
+function parseMemory(value) {
+  if (!value) return undefined;
+  if (typeof value === 'number') return value;
+  const parsed = parseInt(value.replace(/[^0-9]/g, ''), 10);
+  return Number.isNaN(parsed) ? undefined : parsed * 1024 * 1024;
+}
 
 async function runSandbox({ language, sourceCode, stdin }) {
   const lang = LANGUAGE_CONFIG[language];
   if (!lang) throw new Error(`Unsupported language: ${language}`);
 
-  // Ensure reusable container exists
-const memoryBytes =
-  parseInt(config.sandbox.memory || "256") *
-  1024 *
-  1024;
-console.time('1.ensureContainer');
-const meta = await containerManager.ensureContainer(
-  language,
-  lang.image,
-  {
+  await containerManager.ensurePool(language);
+
+  const memoryBytes = parseMemory(config.sandbox.memory) || 512 * 1024 * 1024;
+  const cpuCores = parseFloat(config.sandbox.cpu || '0.5');
+
+  const containerName = await containerManager.acquireContainer(language, {
     memory: memoryBytes,
-    cpus: parseFloat(config.sandbox.cpu || "0.5")
+    cpus: cpuCores
+  });
+
+  if (!containerName) {
+    throw new Error('no_available_container');
   }
-);
-console.timeEnd('1.ensureContainer');
-  // Prepare workspace files and copy into container
-console.time('2.cleanup-before');
+
   const files = [{ name: lang.file, content: sourceCode }];
-  await containerManager.cleanupWorkspace(
-  language
-);
-console.timeEnd('2.cleanup-before');
-console.time('3.copy-source');
-  await containerManager.copyFilesToContainer(language, files);
-console.timeEnd('3.copy-source');
-console.time('4.copy-stdin');
-await containerManager.copyFilesToContainer(
-  language,
-  [{ name: 'input.txt', content: stdin || '' }]
-);
-console.timeEnd('4.copy-stdin');
-  // Build command
-const inner = lang.compile? `${lang.compile} && ${lang.run} < input.txt` : `${lang.run} < input.txt`;
-  // write stdin to input.txt inside container
-  await containerManager.copyFilesToContainer(language, [{ name: 'input.txt', content: stdin || '' }]);
-
+  const command = lang.compile ? `${lang.compile} && ${lang.run} < input.txt` : `${lang.run} < input.txt`;
   const startTime = Date.now();
+  let shouldRecycle = false;
+
   try {
-    console.time('5.compile-run');
-    const execRes = await containerManager.execInContainer(language, inner, { timeout: config.sandbox.timeoutMs });
-    console.timeEnd('5.compile-run');
-    console.time('6.cleanup-after');
-    await containerManager.cleanupWorkspace(language);
-    console.timeEnd('6.cleanup-after');
-    await containerManager.incrementUsage(language);
+    console.time("cleanup-before");
+    await containerManager.cleanupWorkspace(containerName);
+    console.timeEnd("cleanup-before");
+    console.time("copy-source");
+    await containerManager.copyFilesToContainer(containerName, files);
+    console.timeEnd("copy-source");
+    console.time("copy-stdin");
+    await containerManager.copyFilesToContainer(containerName, [{ name: 'input.txt', content: stdin || '' }]);
+    console.timeEnd("copy-stdin");
+    console.time("compile-run");
+    const execRes = await containerManager.execInContainer(containerName, command, { timeout: config.sandbox.timeoutMs });
+    console.timeEnd("compile-run");
+    console.time("cleanup-after");
+    await containerManager.cleanupWorkspace(containerName);
+    console.timeEnd("cleanup-after");
 
-    const stdout = execRes.stdout || '';
-    const stderr = execRes.stderr || '';
+    shouldRecycle = await containerManager.incrementUsage(containerName);
 
-    // read compile.err and runtime.err if needed
-    // For simplicity, return captured stdout/stderr
-    const executionTime = Date.now() - startTime;
-    return { stdout, stderr, compileOutput: '', verdict: 'Accepted', timeMs: executionTime, memory: 0 };
+    return {
+      stdout: execRes.stdout || '',
+      stderr: execRes.stderr || '',
+      compileOutput: '',
+      verdict: 'Accepted',
+      timeMs: Date.now() - startTime,
+      memory: 0
+    };
   } catch (err) {
-     await containerManager.cleanupWorkspace(language);
-    const executionTime = Date.now() - startTime;
-    let verdict = 'Runtime Error';
-    if (err.message && err.message.includes('timeout')) verdict = 'Time Limit Exceeded';
-    return { stdout: err.stdout || '', stderr: err.stderr || err.message || '', compileOutput: '', verdict, timeMs: executionTime, memory: 0 };
+    await containerManager.cleanupWorkspace(containerName).catch(() => {});
+    return {
+      stdout: err.stdout || '',
+      stderr: err.stderr || err.message || '',
+      compileOutput: '',
+      verdict: err.message && err.message.includes('timeout') ? 'Time Limit Exceeded' : 'Runtime Error',
+      timeMs: Date.now() - startTime,
+      memory: 0
+    };
+  } finally {
+    if (containerName) {
+      await containerManager.releaseContainer(containerName, {
+        recycle: shouldRecycle,
+        opts: {
+          memory: memoryBytes,
+          cpus: cpuCores
+        }
+      }).catch((releaseErr) => {
+        console.error(`Failed to release container ${containerName}:`, releaseErr.message);
+      });
+    }
   }
 }
 
-
-
 module.exports = { runSandbox };
-

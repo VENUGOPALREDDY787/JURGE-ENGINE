@@ -18,9 +18,14 @@ module.exports = {
     password: process.env.REDIS_PASSWORD || undefined
   },
   sandbox: {
-    cpu: process.env.SANDBOX_CPU || '10',
+    cpu: process.env.SANDBOX_CPU || '2',
     memory: process.env.SANDBOX_MEMORY || '512m',
     timeoutMs: parseInt(process.env.SANDBOX_TIMEOUT_MS || '5000', 10)
   },
+  pool: {
+    java: parseInt(process.env.JAVA_POOL_SIZE || '5', 10),
+    default: parseInt(process.env.POOL_SIZE || '1', 10)
+  },
+  containerRecycleThreshold: parseInt(process.env.CONTAINER_RECYCLE_THRESHOLD || '20', 10),
   supportedLanguages: SUPPORTED_LANGUAGES
 };
