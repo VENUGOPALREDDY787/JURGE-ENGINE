@@ -18,8 +18,8 @@ module.exports = {
     password: process.env.REDIS_PASSWORD || undefined
   },
   sandbox: {
-    cpu: process.env.SANDBOX_CPU || '0.5',
-    memory: process.env.SANDBOX_MEMORY || '256m',
+    cpu: process.env.SANDBOX_CPU || '10',
+    memory: process.env.SANDBOX_MEMORY || '512m',
     timeoutMs: parseInt(process.env.SANDBOX_TIMEOUT_MS || '5000', 10)
   },
   supportedLanguages: SUPPORTED_LANGUAGES
