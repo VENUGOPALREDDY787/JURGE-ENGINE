@@ -238,49 +238,63 @@ async function acquireContainer(language, opts = {}) {
   const poolConfig = await ensurePool(language);
   const now = new Date().toISOString();
 
-  let info = await popFreeContainer(language);
-  if (info) {
-    return info.name;
-  }
+  while (true) {
+    // Try to get free container first
+    let info = await popFreeContainer(language);
+    if (info) return info.name;
 
-  const lock = await acquireLock(getLockKey(`acquire:${language}`));
-  if (!lock) {
-    info = await popFreeContainer(language);
-    return info ? info.name : null;
-  }
+    // Lock creation/recycle for this language
+    let lock = await acquireLock(
+      getLockKey(`acquire:${language}`),
+      5000
+    );
 
-  try {
-    info = await popFreeContainer(language);
-    if (info) {
-      return info.name;
+    if (!lock) {
+      await new Promise(r => setTimeout(r, 100));
+      continue;
     }
 
-    const existing = await redis.smembers(getContainersSetKey(language));
-    if (existing.length >= poolConfig.poolSize) {
-      return null;
+    try {
+      // Recheck after lock
+      info = await popFreeContainer(language);
+      if (info) return info.name;
+
+      const existing = await redis.smembers(
+        getContainersSetKey(language)
+      );
+
+      console.log("POOL SIZE:", poolConfig.poolSize);
+      console.log("EXISTING:", existing.length);
+
+      if (existing.length < poolConfig.poolSize) {
+        const index = getFirstAvailableIndex(
+          existing,
+          poolConfig.poolSize
+        );
+
+        const containerName = containerNameFor(language, index);
+
+        console.log("CREATING:", containerName);
+
+        const created = await createContainer(
+          containerName,
+          poolConfig.image,
+          opts
+        );
+
+        await redis.hmset(getMetaKey(containerName), {
+          status: "busy",
+          lastUsed: now
+        });
+
+        return created.name;
+      }
+    } finally {
+      await releaseLock(lock);
     }
 
-    const index = getFirstAvailableIndex(existing, poolConfig.poolSize);
-    const containerName = containerNameFor(language, index);
-    console.log(
-  "POOL SIZE:",
-  poolConfig.poolSize
-);
-
-console.log(
-  "EXISTING:",
-  existing.length
-);
-
-console.log(
-  "CREATING:",
-  containerName
-);
-    const created = await createContainer(containerName, poolConfig.image, opts);
-    await redis.hmset(getMetaKey(containerName), { status: 'busy', lastUsed: now });
-    return created.name;
-  } finally {
-    await releaseLock(lock);
+    // Pool full -> wait instead of fail
+    await new Promise(r => setTimeout(r, 100));
   }
 }
 
@@ -288,23 +302,47 @@ async function releaseContainer(containerName, options = {}) {
   const language = parseLanguageFromContainerName(containerName);
   if (!language) return;
 
-  const lock = await acquireLock(getLockKey(`release:${containerName}`));
-  if (!lock) return;
+  let lock = null;
+
+  while (!lock) {
+    lock = await acquireLock(
+      getLockKey(`release:${containerName}`),
+      5000
+    );
+
+    if (!lock) {
+      await new Promise(r => setTimeout(r, 50));
+    }
+  }
 
   try {
     const freeKey = getFreeKey(language);
     const metaKey = getMetaKey(containerName);
     const now = new Date().toISOString();
-    const usageCount = parseInt(await redis.hget(metaKey, 'usageCount') || '0', 10);
-    const shouldRecycle = options.recycle || usageCount >= RECYCLE_THRESHOLD;
+
+    const usageCount = parseInt(
+      (await redis.hget(metaKey, "usageCount")) || "0",
+      10
+    );
+
+    const shouldRecycle =
+      options.recycle || usageCount >= RECYCLE_THRESHOLD;
 
     if (shouldRecycle) {
+      console.log("CALLING RECYCLE:", containerName);
       await recycleContainer(containerName, options.opts);
       return;
     }
 
-    await redis.hmset(metaKey, { status: 'free', lastUsed: now });
+    await redis.hmset(metaKey, {
+      status: "free",
+      lastUsed: now
+    });
+
+    // prevent duplicates
+    await redis.lrem(freeKey, 0, containerName);
     await redis.lpush(freeKey, containerName);
+
   } finally {
     await releaseLock(lock);
   }
@@ -314,30 +352,57 @@ async function recycleContainer(containerName, opts = {}) {
   const language = parseLanguageFromContainerName(containerName);
   if (!language) return null;
 
-  const lock = await acquireLock(getLockKey(`recycle:${containerName}`));
-  if (!lock) return null;
+  const freeKey = getFreeKey(language);
+
+  // IMPORTANT:
+  // Use SAME lock as acquireContainer
+  let lock = null;
+
+  while (!lock) {
+    lock = await acquireLock(
+      getLockKey(`acquire:${language}`),
+      5000
+    );
+
+    if (!lock) {
+      await new Promise(r => setTimeout(r, 50));
+    }
+  }
 
   try {
     const inspected = await inspectContainer(containerName);
+
     if (inspected) {
       try {
         await inspected.container.stop({ t: 1 });
-      } catch (e) {
-        // ignore stop errors
-      }
+      } catch (e) {}
+
       try {
         await inspected.container.remove({ force: true });
-      } catch (e) {
-        // ignore remove errors
-      }
+      } catch (e) {}
     }
 
     await removeContainerRecords(containerName);
-    const created = await createContainer(containerName, LANGUAGE_IMAGE_MAP[language], opts);
+
+    const created = await createContainer(
+      containerName,
+      LANGUAGE_IMAGE_MAP[language],
+      opts
+    );
+
     const now = new Date().toISOString();
-    await redis.hmset(getMetaKey(containerName), { usageCount: '0', status: 'free', lastUsed: now });
-    await redis.lpush(getFreeKey(language), containerName);
+
+    await redis.hmset(getMetaKey(containerName), {
+      usageCount: "0",
+      status: "free",
+      lastUsed: now
+    });
+
+    await redis.lrem(freeKey, 0, containerName);
+    await redis.lpush(freeKey, containerName);
+
     return created.name;
+
   } finally {
     await releaseLock(lock);
   }

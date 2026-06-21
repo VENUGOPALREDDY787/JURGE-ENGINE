@@ -1,10 +1,11 @@
-version: '3.8'
 services:
   api:
-    build: .
+    build:
+      context: ..
+      dockerfile: Dockerfile
     command: node src/server.js
     ports:
-      - '3000:3000'
+      - "3000:3000"
     environment:
       - MONGODB_URI=mongodb://mongo:27017/judge
       - REDIS_HOST=redis
@@ -14,19 +15,22 @@ services:
 
   worker:
     build:
-      context: .
+      context: ..
       dockerfile: docker/worker.Dockerfile
+    command: node src/workers/launchWorkers.js
     environment:
       - REDIS_HOST=redis
+      - MONGODB_URI=mongodb://mongo:27017/judge
     depends_on:
+      - mongo
       - redis
 
   redis:
     image: redis:6-alpine
     ports:
-      - '6379:6379'
+      - "6379:6379"
 
   mongo:
     image: mongo:6
     ports:
-      - '27017:27017'
+      - "27017:27017"
