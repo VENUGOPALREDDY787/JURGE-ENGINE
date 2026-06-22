@@ -1,19 +1,63 @@
 const mongoose = require('mongoose');
 
-const SubmissionSchema = new mongoose.Schema({
-  sourceCode: { type: String, required: true },
-  language: { type: String, required: true, index: true },
-  stdin: { type: String, default: '' },
-  status: { type: String, enum: ['queued','running','completed','failed'], default: 'queued', index: true },
-  stdout: { type: String, default: '' },
-  stderr: { type: String, default: '' },
-  compileOutput: { type: String, default: '' },
-  executionTime: { type: Number, default: 0 },
-  memoryUsage: { type: Number, default: 0 },
-  verdict: { type: String, default: 'Queued' },
-}, { timestamps: true });
+// ---------------------------------------------------------------------------
+// Status constants — mirrors Judge0 numeric status codes
+// ---------------------------------------------------------------------------
+const STATUS = {
+  IN_QUEUE:          { id: 1,  description: 'In Queue' },
+  PROCESSING:        { id: 2,  description: 'Processing' },
+  ACCEPTED:          { id: 3,  description: 'Accepted' },
+  WRONG_ANSWER:      { id: 4,  description: 'Wrong Answer' },
+  TLE:               { id: 5,  description: 'Time Limit Exceeded' },
+  COMPILATION_ERROR: { id: 6,  description: 'Compilation Error' },
+  RUNTIME_ERROR:     { id: 11, description: 'Runtime Error' },
+  INTERNAL_ERROR:    { id: 13, description: 'Internal Error' },
+};
 
-SubmissionSchema.index({ createdAt: 1 });
+// ---------------------------------------------------------------------------
+// Schema — shared across all per-language collections
+// ---------------------------------------------------------------------------
+const submissionSchema = new mongoose.Schema(
+  {
+    sourceCode:     { type: String, required: true },
+    language:       { type: String, required: true, index: true },
+    stdin:          { type: String, default: '' },
 
-module.exports = mongoose.model('Submission', SubmissionSchema);
-// cleaned: removed duplicate ES module schema definitions
+    // Output fields (Judge0-style)
+    stdout:         { type: String, default: null },
+    stderr:         { type: String, default: null },
+    compile_output: { type: String, default: null },
+    message:        { type: String, default: null },
+
+    // Metrics
+    time:   { type: Number, default: null },  // seconds (float)
+    memory: { type: Number, default: null },  // kilobytes
+
+    // Status object — { id: Number, description: String }
+    status: {
+      id:          { type: Number, default: 1 },
+      description: { type: String, default: 'In Queue' },
+    },
+  },
+  { timestamps: true }
+);
+
+submissionSchema.index({ createdAt: 1 });
+
+// ---------------------------------------------------------------------------
+// Per-language model factory
+// Caches models so mongoose doesn't re-compile the schema on every call.
+// Collection name format:  <language>_submissions
+//   e.g. java → java_submissions, python → python_submissions
+// ---------------------------------------------------------------------------
+const modelCache = {};
+
+function getSubmissionModel(language) {
+  if (modelCache[language]) return modelCache[language];
+  const collectionName = `${language}_submissions`;
+  // 3rd arg to mongoose.model() forces the collection name
+  modelCache[language] = mongoose.model(collectionName, submissionSchema, collectionName);
+  return modelCache[language];
+}
+
+module.exports = { getSubmissionModel, STATUS };

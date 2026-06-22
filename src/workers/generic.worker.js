@@ -1,13 +1,18 @@
 /**
- * Generic worker template. In production you should run workers as separate processes
- * and scale them per-language. This file is a template that shows how to
- * consume jobs and call the sandbox runner, then update MongoDB.
+ * Generic worker template.
+ * One worker instance is started per language by launchWorkers.js.
+ * Each worker reads from its language-specific BullMQ queue and executes
+ * submissions inside the Docker/nsjail sandbox, then persists results to
+ * the corresponding per-language MongoDB collection.
  */
 const { Worker } = require('bullmq');
 const config = require('../config');
-const Submission = require('../models/Submission');
+const { getSubmissionModel, STATUS } = require('../models/Submission');
 const dockerRunner = require('../sandbox/dockerRunner');
 
+// ---------------------------------------------------------------------------
+// Concurrency — respects per-language env var with global fallback
+// ---------------------------------------------------------------------------
 function getConcurrencyForLanguage(lang) {
   const envKey = `${lang.toUpperCase()}_POOL_SIZE`;
   const raw = process.env[envKey] || process.env.POOL_SIZE || '1';
@@ -16,43 +21,73 @@ function getConcurrencyForLanguage(lang) {
   return Math.min(parsed, 10);
 }
 
+// ---------------------------------------------------------------------------
+// Map sandbox verdict string → Judge0-style status object
+// ---------------------------------------------------------------------------
+function verdictToStatus(verdict) {
+  switch (verdict) {
+    case 'Accepted':            return STATUS.ACCEPTED;
+    case 'Time Limit Exceeded': return STATUS.TLE;
+    case 'Compilation Error':   return STATUS.COMPILATION_ERROR;
+    case 'Runtime Error':       return STATUS.RUNTIME_ERROR;
+    default:                    return STATUS.INTERNAL_ERROR;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Start a BullMQ worker for the given language
+// ---------------------------------------------------------------------------
 function startWorkerForLanguage(lang) {
   const queueName = `${lang}-queue`;
   const concurrency = getConcurrencyForLanguage(lang);
-  const worker = new Worker(queueName, async (job) => {
-    const { submissionId, sourceCode, stdin } = job.data;
-    const submission = await Submission.findById(submissionId);
-    if (!submission) throw new Error('submission_missing');
 
-    submission.status = 'running';
-    submission.verdict = 'Running';
-    await submission.save();
+  // Obtain the model for the language-specific collection once per worker
+  const SubmissionModel = getSubmissionModel(lang);
 
-    try {
-      const result = await dockerRunner.runSandbox({ language: lang, sourceCode, stdin });
-      submission.stdout = result.stdout || '';
-      submission.stderr = result.stderr || '';
-      submission.compileOutput = result.compileOutput || '';
-      submission.executionTime = result.timeMs || 0;
-      submission.memoryUsage = result.memory || 0;
-      submission.status = 'completed';
-      submission.verdict = result.verdict || 'Accepted';
+  const worker = new Worker(
+    queueName,
+    async (job) => {
+      // job.data contains only submissionId — full payload is fetched from MongoDB.
+      const { submissionId } = job.data;
+
+      const submission = await SubmissionModel.findById(submissionId);
+      if (!submission) throw new Error('submission_missing');
+
+      // Read execution payload from the persisted document (not from Redis)
+      const { sourceCode, stdin } = submission;
+
+      // Mark as processing
+      submission.status = STATUS.PROCESSING;
       await submission.save();
-    } catch (err) {
-      submission.status = 'failed';
-      submission.verdict = 'Internal Error';
-      submission.stderr = (err && err.message) || String(err);
-      await submission.save();
-      throw err;
+
+      try {
+        const result = await dockerRunner.runSandbox({ language: lang, sourceCode, stdin });
+
+        submission.stdout         = result.stdout         ?? null;
+        submission.stderr         = result.stderr         ?? null;
+        submission.compile_output = result.compile_output ?? null;
+        submission.message        = result.message        ?? null;
+        // timeMs from sandbox is milliseconds; store as fractional seconds
+        submission.time           = result.timeMs != null ? result.timeMs / 1000 : null;
+        submission.memory         = result.memory         ?? null;
+        submission.status         = verdictToStatus(result.verdict);
+        await submission.save();
+      } catch (err) {
+        submission.status  = STATUS.INTERNAL_ERROR;
+        submission.message = (err && err.message) || String(err);
+        await submission.save();
+        throw err; // re-throw so BullMQ records the failure and can retry
+      }
+    },
+    {
+      concurrency,
+      connection: {
+        host:     config.redis.host,
+        port:     config.redis.port,
+        password: config.redis.password,
+      },
     }
-  }, {
-    concurrency,
-    connection: {
-      host: config.redis.host,
-      port: config.redis.port,
-      password: config.redis.password
-    }
-  });
+  );
 
   worker.on('failed', (job, err) => {
     console.error(`Job ${job.id} failed:`, err.message);

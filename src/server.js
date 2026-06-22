@@ -4,7 +4,8 @@ const mongoose = require('mongoose');
 const morgan = require('morgan');
 const helmet = require('helmet');
 const compression = require('compression');
-const routes = require('./routes/submission.routes');
+const routes        = require('./routes/submission.routes');
+const runtimeRoutes = require('./routes/runtime.routes');
 const { initQueues } = require('./services/queue.service');
 const { setupMetrics } = require('./utils/metrics');
 
@@ -21,6 +22,7 @@ app.get('/api/metrics', setupMetrics);
 
 // API
 app.use('/api/submissions', routes);
+app.use('/api/runtimes',    runtimeRoutes);
 
 
 const PORT = process.env.PORT || 3000;

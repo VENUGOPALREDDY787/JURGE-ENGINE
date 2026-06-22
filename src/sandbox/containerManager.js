@@ -84,7 +84,14 @@ async function removeContainerRecords(containerName) {
 async function inspectContainer(containerName) {
   try {
     const container = docker.getContainer(containerName);
-    const info = await container.inspect();
+    let info = await container.inspect();
+
+    if (!info.State.Running) {
+      console.log(`STARTING STOPPED CONTAINER: ${containerName}`);
+      await container.start();
+      info = await container.inspect();
+    }
+
     return { container, info };
   } catch (e) {
     return null;
@@ -259,9 +266,22 @@ async function acquireContainer(language, opts = {}) {
       info = await popFreeContainer(language);
       if (info) return info.name;
 
-      const existing = await redis.smembers(
-        getContainersSetKey(language)
-      );
+      const rawExisting = await redis.smembers(
+  getContainersSetKey(language)
+);
+
+const existing = [];
+
+for (const name of rawExisting) {
+  const info = await inspectContainer(name);
+
+  if (info) {
+    existing.push(name);
+  } else {
+    console.log("REMOVING STALE REDIS ENTRY:", name);
+    await removeContainerRecords(name);
+  }
+}
 
       console.log("POOL SIZE:", poolConfig.poolSize);
       console.log("EXISTING:", existing.length);
@@ -478,6 +498,52 @@ async function cleanupWorkspace(containerName) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// drainLanguagePool(language)
+// Called by runtime.service after a successful image rebuild.
+// Stops and removes every Docker container belonging to this language and
+// clears all associated Redis state so the pool starts fresh.
+//
+// Uses the SAME acquire-lock as acquireContainer so no new container can
+// be created in between — incoming jobs will queue in BullMQ and retry.
+// ---------------------------------------------------------------------------
+async function drainLanguagePool(language) {
+  let lock = null;
+
+  // Spin until we hold the acquire-lock for this language
+  while (!lock) {
+    lock = await acquireLock(getLockKey(`acquire:${language}`), 10000);
+    if (!lock) await new Promise((r) => setTimeout(r, 100));
+  }
+
+  try {
+    const containerSetKey = getContainersSetKey(language);
+    const freeKey         = getFreeKey(language);
+    const containerNames  = await redis.smembers(containerSetKey);
+
+    console.log(`[drain] Stopping and removing ${containerNames.length} container(s) for ${language}`);
+
+    for (const name of containerNames) {
+      const inspected = await inspectContainer(name);
+      if (inspected) {
+        try { await inspected.container.stop({ t: 1 }); }   catch (e) { /* ignore */ }
+        try { await inspected.container.remove({ force: true }); } catch (e) { /* ignore */ }
+      }
+      // Remove all Redis records for this container
+      await removeContainerRecords(name);
+    }
+
+    // Belt-and-braces: delete the top-level set and free-list keys
+    // in case any stale entries remain after individual removals.
+    await redis.del(freeKey);
+    await redis.del(containerSetKey);
+
+    console.log(`[drain] Pool fully cleared for ${language}`);
+  } finally {
+    await releaseLock(lock);
+  }
+}
+
 module.exports = {
   ensurePool,
   acquireContainer,
@@ -485,5 +551,6 @@ module.exports = {
   copyFilesToContainer,
   execInContainer,
   cleanupWorkspace,
-  incrementUsage
+  incrementUsage,
+  drainLanguagePool,
 };
