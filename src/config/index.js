@@ -23,8 +23,12 @@ module.exports = {
     timeoutMs: parseInt(process.env.SANDBOX_TIMEOUT_MS || '5000', 10)
   },
   pool: {
-    java: parseInt(process.env.JAVA_POOL_SIZE || '5', 10),
-    default: parseInt(process.env.POOL_SIZE || '1', 10)
+    java:              parseInt(process.env.JAVA_POOL_SIZE || '5',  10),
+    default:           parseInt(process.env.POOL_SIZE      || '1',  10),
+    // Dynamic autoscaling — min/max per language (or global fallback)
+    minSize:           parseInt(process.env.MIN_POOL_SIZE  || '1',  10),
+    maxSize:           parseInt(process.env.MAX_POOL_SIZE  || process.env.POOL_SIZE || '10', 10),
+    scaleDownInterval: parseInt(process.env.SCALE_DOWN_INTERVAL_MS || '60000', 10),
   },
   containerRecycleThreshold: parseInt(process.env.CONTAINER_RECYCLE_THRESHOLD || '20', 10),
   supportedLanguages: SUPPORTED_LANGUAGES

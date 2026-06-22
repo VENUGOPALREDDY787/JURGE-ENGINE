@@ -19,12 +19,30 @@ const LANGUAGE_IMAGE_MAP = {
   go: 'judge-go-nsjail'
 };
 
-function getPoolSize(language) {
-  const envName = `${language.toUpperCase()}_POOL_SIZE`;
-  const raw = process.env[envName] || process.env.POOL_SIZE || '1';
+// ---------------------------------------------------------------------------
+// getMinPoolSize / getMaxPoolSize
+// Replaces the old single getPoolSize(). Supports per-language overrides:
+//   JAVA_MIN_POOL_SIZE / JAVA_MAX_POOL_SIZE take highest priority,
+//   then global MIN_POOL_SIZE / MAX_POOL_SIZE,
+//   then existing JAVA_POOL_SIZE / POOL_SIZE for backward compatibility.
+// ---------------------------------------------------------------------------
+function getMinPoolSize(language) {
+  const envName = `${language.toUpperCase()}_MIN_POOL_SIZE`;
+  const raw = process.env[envName] || process.env.MIN_POOL_SIZE || '1';
   const parsed = parseInt(raw, 10);
-  if (Number.isNaN(parsed) || parsed < 1) return 1;
-  return Math.min(parsed, 10);
+  return Number.isNaN(parsed) || parsed < 1 ? 1 : parsed;
+}
+
+function getMaxPoolSize(language) {
+  const envName = `${language.toUpperCase()}_MAX_POOL_SIZE`;
+  // Fallback chain: per-lang max → global max → existing per-lang size → global size → 10
+  const raw = process.env[envName]
+    || process.env.MAX_POOL_SIZE
+    || process.env[`${language.toUpperCase()}_POOL_SIZE`]
+    || process.env.POOL_SIZE
+    || '10';
+  const parsed = parseInt(raw, 10);
+  return Number.isNaN(parsed) || parsed < 1 ? 10 : parsed;
 }
 
 function getFreeKey(language) {
@@ -214,19 +232,29 @@ async function createContainer(containerName, image, opts = {}) {
 
 async function popFreeContainer(language) {
   const freeKey = getFreeKey(language);
+
   while (true) {
     const containerName = await redis.rpop(freeKey);
-    if (!containerName) return null;
 
-    const info = await getContainerInfo(containerName);
-    if (!info) {
+    if (!containerName) {
+      return null;
+    }
+
+    const metaExists = await redis.exists(getMetaKey(containerName));
+
+    if (!metaExists) {
       await removeContainerRecords(containerName);
       continue;
     }
 
     const now = new Date().toISOString();
-    await redis.hmset(getMetaKey(containerName), { status: 'busy', lastUsed: now });
-    return info;
+
+    await redis.hmset(getMetaKey(containerName), {
+      status: "busy",
+      lastUsed: now
+    });
+
+    return { name: containerName };
   }
 }
 
@@ -236,7 +264,8 @@ async function ensurePool(language) {
   }
 
   return {
-    poolSize: getPoolSize(language),
+    minPoolSize: getMinPoolSize(language),
+    maxPoolSize: getMaxPoolSize(language),
     image: LANGUAGE_IMAGE_MAP[language]
   };
 }
@@ -266,30 +295,47 @@ async function acquireContainer(language, opts = {}) {
       info = await popFreeContainer(language);
       if (info) return info.name;
 
-      const rawExisting = await redis.smembers(
+ const existingCount = await redis.scard(
   getContainersSetKey(language)
 );
 
-const existing = [];
+console.log("MAX POOL SIZE:", poolConfig.maxPoolSize);
+console.log("EXISTING:", existingCount);
 
-for (const name of rawExisting) {
-  const info = await inspectContainer(name);
+if (existingCount < poolConfig.maxPoolSize) {
+  const rawExisting = await redis.smembers(
+    getContainersSetKey(language)
+  );
 
-  if (info) {
-    existing.push(name);
-  } else {
-    console.log("REMOVING STALE REDIS ENTRY:", name);
-    await removeContainerRecords(name);
-  }
+  const index = getFirstAvailableIndex(
+    rawExisting,
+    poolConfig.maxPoolSize
+  );
+
+  const containerName = containerNameFor(language, index);
+
+  console.log("CREATING:", containerName);
+
+  const created = await createContainer(
+    containerName,
+    poolConfig.image,
+    opts
+  );
+
+  await redis.hmset(getMetaKey(containerName), {
+    status: "busy",
+    lastUsed: now
+  });
+
+  return created.name;
 }
-
-      console.log("POOL SIZE:", poolConfig.poolSize);
+      console.log("MAX POOL SIZE:", poolConfig.maxPoolSize);
       console.log("EXISTING:", existing.length);
 
-      if (existing.length < poolConfig.poolSize) {
+      if (existing.length < poolConfig.maxPoolSize) {
         const index = getFirstAvailableIndex(
           existing,
-          poolConfig.poolSize
+          poolConfig.maxPoolSize
         );
 
         const containerName = containerNameFor(language, index);
@@ -544,6 +590,79 @@ async function drainLanguagePool(language) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// scaleDownPool(language)
+// Called by the background idle watcher in launchWorkers.js.
+// Fires only when BullMQ reports 0 waiting + 0 active jobs for a language.
+//
+// Removes free containers above MIN_POOL_SIZE, keeping the lowest-indexed
+// containers alive (judge-<lang>-1 … judge-<lang>-MIN).
+//
+// Safety guarantees:
+//   - Holds the same acquire-lock used by acquireContainer → mutual exclusion
+//   - Aborts immediately if any container is found busy (never removes active)
+//   - Non-blocking: skips this cycle if lock is unavailable (jobs being acquired)
+// ---------------------------------------------------------------------------
+async function scaleDownPool(language) {
+  const minSize = getMinPoolSize(language);
+
+  // Non-blocking lock attempt — if acquireContainer holds the lock, skip cycle
+  const lock = await acquireLock(getLockKey(`acquire:${language}`), 5000);
+  if (!lock) {
+    console.log(`[autoscale] ${language}: lock busy, skipping scale-down cycle`);
+    return;
+  }
+
+  try {
+    const containerSetKey = getContainersSetKey(language);
+    const containerNames  = await redis.smembers(containerSetKey);
+
+    if (containerNames.length <= minSize) return; // already at or below min — nothing to do
+
+    // Classify containers by current Redis status
+    const freeContainers = [];
+    for (const name of containerNames) {
+      const status = await redis.hget(getMetaKey(name), 'status');
+      if (status === 'busy') {
+        // A job started between the queue-idle check and now — abort entirely
+        console.log(`[autoscale] ${language}: found busy container ${name}, aborting scale-down`);
+        return;
+      }
+      if (status === 'free') freeContainers.push(name);
+    }
+
+    if (freeContainers.length <= minSize) return;
+
+    // Sort ascending by numeric suffix → keeps lowest-indexed containers alive
+    freeContainers.sort((a, b) => {
+      const idxA = parseInt(a.match(/-(\d+)$/)?.[1] || '0', 10);
+      const idxB = parseInt(b.match(/-(\d+)$/)?.[1] || '0', 10);
+      return idxA - idxB;
+    });
+
+    const toRemove = freeContainers.slice(minSize); // drop everything above minSize
+    if (toRemove.length === 0) return;
+
+    console.log(
+      `[autoscale] ${language}: scaling down ${containerNames.length} → ` +
+      `${containerNames.length - toRemove.length} containers (min=${minSize})`
+    );
+
+    for (const name of toRemove) {
+      const inspected = await inspectContainer(name);
+      if (inspected) {
+        try { await inspected.container.stop({ t: 1 }); }          catch (e) { /* ignore */ }
+        try { await inspected.container.remove({ force: true }); } catch (e) { /* ignore */ }
+      }
+      await removeContainerRecords(name); // clears Redis set + free-list entry + meta key
+    }
+
+    console.log(`[autoscale] ${language} pool settled at ${containerNames.length - toRemove.length} containers`);
+  } finally {
+    await releaseLock(lock);
+  }
+}
+
 module.exports = {
   ensurePool,
   acquireContainer,
@@ -553,4 +672,5 @@ module.exports = {
   cleanupWorkspace,
   incrementUsage,
   drainLanguagePool,
+  scaleDownPool,
 };

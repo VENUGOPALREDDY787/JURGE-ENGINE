@@ -1,4 +1,4 @@
-const config = require('../config');
+﻿const config = require('../config');
 const containerManager = require('./containerManager');
 
 // ---------------------------------------------------------------------------
@@ -57,7 +57,7 @@ async function runSandbox({ language, sourceCode, stdin }) {
   const lang = LANGUAGE_CONFIG[language];
   if (!lang) throw new Error(`Unsupported language: ${language}`);
 
-  await containerManager.ensurePool(language);
+  // await containerManager.ensurePool(language);
 
   const memoryBytes = parseMemory(config.sandbox.memory) || 512 * 1024 * 1024;
   const cpuCores    = parseFloat(config.sandbox.cpu || '0.5');

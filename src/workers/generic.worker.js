@@ -11,14 +11,25 @@ const { getSubmissionModel, STATUS } = require('../models/Submission');
 const dockerRunner = require('../sandbox/dockerRunner');
 
 // ---------------------------------------------------------------------------
-// Concurrency — respects per-language env var with global fallback
+// Concurrency — mirrors getMaxPoolSize() fallback chain in containerManager.js
+// so worker concurrency always matches the max container pool for this language.
+// Fallback order:
+//   1. <LANG>_MAX_POOL_SIZE  (e.g. JAVA_MAX_POOL_SIZE)
+//   2. MAX_POOL_SIZE          (global max)
+//   3. <LANG>_POOL_SIZE       (legacy per-language, backward compat)
+//   4. POOL_SIZE              (legacy global, backward compat)
+//   5. '1'                    (safe default)
 // ---------------------------------------------------------------------------
 function getConcurrencyForLanguage(lang) {
-  const envKey = `${lang.toUpperCase()}_POOL_SIZE`;
-  const raw = process.env[envKey] || process.env.POOL_SIZE || '1';
+  const perLangMax    = `${lang.toUpperCase()}_MAX_POOL_SIZE`;
+  const perLangLegacy = `${lang.toUpperCase()}_POOL_SIZE`;
+  const raw = process.env[perLangMax]
+    || process.env.MAX_POOL_SIZE
+    || process.env[perLangLegacy]
+    || process.env.POOL_SIZE
+    || '1';
   const parsed = parseInt(raw, 10);
-  if (Number.isNaN(parsed) || parsed < 1) return 1;
-  return Math.min(parsed, 10);
+  return Number.isNaN(parsed) || parsed < 1 ? 1 : parsed;
 }
 
 // ---------------------------------------------------------------------------
