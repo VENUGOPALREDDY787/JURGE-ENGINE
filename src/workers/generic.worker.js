@@ -82,6 +82,20 @@ function startWorkerForLanguage(lang) {
         submission.time           = result.timeMs != null ? result.timeMs / 1000 : null;
         submission.memory         = result.memory         ?? null;
         submission.status         = verdictToStatus(result.verdict);
+
+        // Judge0 expected_output comparison.
+        // Only runs when the client provided expected_output AND the sandbox
+        // itself produced a clean execution (no compile/runtime/TLE error).
+        // Error verdicts are never silently overridden — they surface as-is.
+        if (
+          submission.expected_output != null &&
+          submission.status.id === STATUS.ACCEPTED.id
+        ) {
+          const actual   = (submission.stdout || '').trim();
+          const expected = submission.expected_output.trim();
+          submission.status = actual === expected ? STATUS.ACCEPTED : STATUS.WRONG_ANSWER;
+        }
+
         await submission.save();
       } catch (err) {
         submission.status  = STATUS.INTERNAL_ERROR;

@@ -2,11 +2,22 @@ require('dotenv').config();
 
 const mongoose      = require('mongoose');
 const { Queue }     = require('bullmq');
+const Redis         = require('ioredis');
 const config        = require('../config');
 const { startWorkerForLanguage } = require('./generic.worker');
 const { scaleDownPool }          = require('../sandbox/containerManager');
+const containerManager           = require('../sandbox/containerManager');
+const queueService               = require('../services/queue.service');
+const langRegistry               = require('../utils/languageRegistry');
+const LanguageConfig             = require('../models/LanguageConfig');
 
 const LANGS = Object.values(config.supportedLanguages);
+
+const redisConn = {
+  host:     config.redis.host,
+  port:     config.redis.port,
+  password: config.redis.password,
+};
 
 async function launch() {
   const mongoUri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/judge';
@@ -14,31 +25,36 @@ async function launch() {
   await mongoose.connect(mongoUri);
   console.log('Worker MongoDB connected');
 
-  // ── Start one BullMQ worker per language (unchanged) ──────────────────────
+  // ── Start one BullMQ worker per statically configured language ────────────
   LANGS.forEach((lang) => {
     startWorkerForLanguage(lang);
   });
 
+  // ── Load dynamically registered languages from MongoDB ────────────────────
+  // Any language added via POST /admin/languages while this process was offline
+  // is persisted in language_configs. We restore them here on startup so no
+  // jobs are left unprocessed.
+  try {
+    const dynamicLangs = await LanguageConfig.find({ status: 'active' }).lean();
+    for (const lc of dynamicLangs) {
+      const { language, imageName } = lc;
+      if (langRegistry.isSupported(language)) continue; // already in static config
+
+      containerManager.registerLanguage(language, imageName);
+      queueService.createQueue(language);
+      langRegistry.register(language);
+      startWorkerForLanguage(language);
+      console.log(`[dynamic] Restored worker for persisted language: ${language}`);
+    }
+  } catch (err) {
+    console.warn('[dynamic] Failed to load dynamic languages from DB:', err.message);
+    // Non-fatal — statically configured languages continue working normally
+  }
+
   // ── Background idle-based auto scale-down watcher ─────────────────────────
-  // Every SCALE_DOWN_INTERVAL_MS milliseconds, check each language queue.
-  // If there are ZERO waiting jobs AND ZERO active jobs, shrink the container
-  // pool for that language back to MIN_POOL_SIZE.
-  //
-  // The scaleDownPool() function holds the same acquire-lock used by
-  // acquireContainer(), so scale-down and job acquisition are mutually
-  // exclusive — no race conditions possible.
-  //
-  // Errors are caught and logged; they never propagate to the execution path.
-  const redisConn = {
-    host:     config.redis.host,
-    port:     config.redis.port,
-    password: config.redis.password,
-  };
   const scaleDownInterval = config.pool.scaleDownInterval;
 
   LANGS.forEach((lang) => {
-    // Lightweight read-only Queue instance used only for queue-depth checks.
-    // Does NOT interfere with the Queue instances in queue.service.js.
     const monitorQueue = new Queue(`${lang}-queue`, { connection: redisConn });
 
     const timer = setInterval(async () => {
@@ -47,21 +63,65 @@ async function launch() {
           monitorQueue.getWaitingCount(),
           monitorQueue.getActiveCount(),
         ]);
-
         if (waiting === 0 && active === 0) {
           await scaleDownPool(lang);
         }
       } catch (err) {
-        // Non-fatal — log and continue; watcher fires again next interval
-        console.warn(`[autoscale] Scale-down check failed for ${lang}:`, err.message);
+        console.warn(`[autoscale] Check failed for ${lang}:`, err.message);
       }
     }, scaleDownInterval);
 
-    // Prevent this timer from keeping the process alive after workers shut down
     timer.unref();
   });
 
-  console.log(`[autoscale] Idle scale-down watcher active (interval: ${scaleDownInterval}ms, min: ${config.pool.minSize})`);
+  console.log(`[autoscale] Idle scale-down watcher active (interval: ${scaleDownInterval}ms)`);
+
+  // ── Redis pub/sub — real-time dynamic language registration ──────────────
+  // When admin.service.addLanguage() publishes 'jurge:new-language', this
+  // subscriber starts a new BullMQ Worker for that language immediately.
+  // No worker restart required.
+  const sub = new Redis(redisConn);
+
+  sub.on('error', (err) => {
+    console.warn('[dynamic] Redis subscriber error:', err.message);
+  });
+
+  sub.subscribe('jurge:new-language', (err) => {
+    if (err) {
+      console.warn('[dynamic] Failed to subscribe to jurge:new-language:', err.message);
+    } else {
+      console.log('[dynamic] Subscribed to jurge:new-language channel');
+    }
+  });
+
+  sub.on('message', async (channel, language) => {
+    if (channel !== 'jurge:new-language') return;
+    if (langRegistry.isSupported(language)) {
+      console.log(`[dynamic] Worker for '${language}' already running — skipping`);
+      return;
+    }
+
+    console.log(`[dynamic] Received pub/sub: starting worker for '${language}'`);
+
+    try {
+      // Fetch the image name from MongoDB (set by admin.service.addLanguage)
+      const lc = await LanguageConfig.findOne({ language, status: 'active' }).lean();
+      if (!lc) {
+        console.warn(`[dynamic] No active LanguageConfig for '${language}' — cannot start worker`);
+        return;
+      }
+
+      containerManager.registerLanguage(language, lc.imageName);
+      queueService.createQueue(language);
+      langRegistry.register(language);
+      startWorkerForLanguage(language);
+
+      console.log(`[dynamic] Worker started for new language: ${language}`);
+    } catch (err) {
+      console.error(`[dynamic] Failed to start worker for '${language}':`, err.message);
+      // Non-fatal — jobs queue in BullMQ and will be processed on next worker restart
+    }
+  });
 }
 
 launch().catch((e) => {

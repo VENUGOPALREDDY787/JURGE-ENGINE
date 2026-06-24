@@ -1,11 +1,9 @@
 const { getSubmissionModel, STATUS } = require('../models/Submission');
 const queueService = require('./queue.service');
-const config = require('../config');
+const langRegistry = require('../utils/languageRegistry');
 
-const VALID_LANGS = Object.values(config.supportedLanguages);
-
-async function createAndEnqueue({ sourceCode, language, stdin }) {
-  if (!VALID_LANGS.includes(language)) throw new Error('unsupported_language');
+async function createAndEnqueue({ sourceCode, language, stdin, expected_output }) {
+  if (!langRegistry.isSupported(language)) throw new Error('unsupported_language');
 
   // Route to the language-specific collection via the factory
   const SubmissionModel = getSubmissionModel(language);
@@ -13,6 +11,7 @@ async function createAndEnqueue({ sourceCode, language, stdin }) {
     sourceCode,
     language,
     stdin,
+    expected_output: expected_output || null,
     status: STATUS.IN_QUEUE,
   });
 

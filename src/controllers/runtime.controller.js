@@ -1,8 +1,6 @@
 const { Runtime, seedRuntimeDefaults } = require('../models/Runtime');
 const runtimeService = require('../services/runtime.service');
-const config = require('../config');
-
-const VALID_LANGS = Object.values(config.supportedLanguages);
+const langRegistry = require('../utils/languageRegistry');
 
 // ---------------------------------------------------------------------------
 // GET /api/runtimes
@@ -29,7 +27,7 @@ exports.listRuntimes = async (req, res) => {
 exports.getRuntime = async (req, res) => {
   try {
     const { language } = req.params;
-    if (!VALID_LANGS.includes(language)) {
+    if (!langRegistry.isSupported(language)) {
       return res.status(400).json({ error: 'unsupported_language' });
     }
 
@@ -57,7 +55,7 @@ exports.updateRuntime = async (req, res) => {
     const { version }  = req.body;
 
     // Validate language
-    if (!VALID_LANGS.includes(language)) {
+    if (!langRegistry.isSupported(language)) {
       return res.status(400).json({ error: 'unsupported_language' });
     }
 
@@ -113,7 +111,7 @@ exports.updateRuntime = async (req, res) => {
 exports.getRuntimeStatus = async (req, res) => {
   try {
     const { language } = req.params;
-    if (!VALID_LANGS.includes(language)) {
+    if (!langRegistry.isSupported(language)) {
       return res.status(400).json({ error: 'unsupported_language' });
     }
 

@@ -37,13 +37,39 @@ function getQueueForLanguage(lang) {
   return queues[lang];
 }
 
+/**
+ * createQueue(lang)
+ * Creates a BullMQ Queue + QueueScheduler for a dynamically added language.
+ * Idempotent — returns the existing queue if already created.
+ * Called by admin.service.addLanguage() after a successful image build.
+ */
+function createQueue(lang) {
+  if (queues[lang]) return queues[lang]; // already exists — no-op
+  const name = `${lang}-queue`;
+  queues[lang] = new Queue(name, connection);
+  new QueueScheduler(name, connection);
+  console.log(`[queue] Created queue for new language: ${lang}`);
+  return queues[lang];
+}
+
+/**
+ * getAllQueues()
+ * Returns a snapshot object { lang: Queue } for all currently known queues.
+ * Used by admin.service.getQueueMetrics().
+ */
+function getAllQueues() {
+  return { ...queues };
+}
+
 module.exports = {
   initQueues: async () => {
     const result = await initQueues();
-    // expose router and queues
     module.exports.bullBoardRouter = result.router;
     module.exports.queues = queues;
+    return result;
   },
   getQueueForLanguage,
+  createQueue,
+  getAllQueues,
   bullBoardRouter: null,
 };

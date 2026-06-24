@@ -31,5 +31,6 @@ module.exports = {
     scaleDownInterval: parseInt(process.env.SCALE_DOWN_INTERVAL_MS || '60000', 10),
   },
   containerRecycleThreshold: parseInt(process.env.CONTAINER_RECYCLE_THRESHOLD || '20', 10),
+  adminApiKey:               process.env.ADMIN_API_KEY || null,
   supportedLanguages: SUPPORTED_LANGUAGES
 };

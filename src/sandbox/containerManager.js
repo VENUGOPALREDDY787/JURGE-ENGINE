@@ -663,6 +663,41 @@ async function scaleDownPool(language) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// getPoolMetrics(language)
+// Returns Redis-backed pool state for the admin metrics API.
+// Pure read — no Docker API calls, no locks acquired.
+// ---------------------------------------------------------------------------
+async function getPoolMetrics(language) {
+  const containerNames = await redis.smembers(getContainersSetKey(language));
+  let busyCount = 0;
+  let freeCount = 0;
+
+  for (const name of containerNames) {
+    const status = await redis.hget(getMetaKey(name), 'status');
+    if (status === 'busy') busyCount += 1;
+    else if (status === 'free') freeCount += 1;
+  }
+
+  return {
+    total:   containerNames.length,
+    busy:    busyCount,
+    free:    freeCount,
+    minSize: getMinPoolSize(language),
+    maxSize: getMaxPoolSize(language),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// registerLanguage(language, imageName)
+// Expands LANGUAGE_IMAGE_MAP at runtime for dynamically added languages.
+// Called by admin.service.addLanguage() after a successful image build.
+// Idempotent — safe to call multiple times.
+// ---------------------------------------------------------------------------
+function registerLanguage(language, imageName) {
+  LANGUAGE_IMAGE_MAP[language] = imageName;
+}
+
 module.exports = {
   ensurePool,
   acquireContainer,
@@ -673,4 +708,6 @@ module.exports = {
   incrementUsage,
   drainLanguagePool,
   scaleDownPool,
+  getPoolMetrics,
+  registerLanguage,
 };

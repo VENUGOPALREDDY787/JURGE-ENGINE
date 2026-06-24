@@ -24,10 +24,16 @@ const submissionSchema = new mongoose.Schema(
     stdin:          { type: String, default: '' },
 
     // Output fields (Judge0-style)
-    stdout:         { type: String, default: null },
-    stderr:         { type: String, default: null },
-    compile_output: { type: String, default: null },
-    message:        { type: String, default: null },
+    stdout:          { type: String, default: null },
+    stderr:          { type: String, default: null },
+    compile_output:  { type: String, default: null },
+    message:         { type: String, default: null },
+
+    // Optional Judge0-style output validator.
+    // When set, the worker compares stdout.trim() against this value and
+    // sets status = ACCEPTED or WRONG_ANSWER accordingly.
+    // Null means no comparison — verdict comes directly from the sandbox.
+    expected_output: { type: String, default: null },
 
     // Metrics
     time:   { type: Number, default: null },  // seconds (float)

@@ -6,6 +6,8 @@ const helmet = require('helmet');
 const compression = require('compression');
 const routes        = require('./routes/submission.routes');
 const runtimeRoutes = require('./routes/runtime.routes');
+const adminRoutes   = require('./routes/admin.routes');
+const adminAuth     = require('./middleware/adminAuth');
 const { initQueues } = require('./services/queue.service');
 const { setupMetrics } = require('./utils/metrics');
 
@@ -23,6 +25,9 @@ app.get('/api/metrics', setupMetrics);
 // API
 app.use('/api/submissions', routes);
 app.use('/api/runtimes',    runtimeRoutes);
+
+// Admin portal — all routes protected by API key auth
+app.use('/admin', adminAuth, adminRoutes);
 
 
 const PORT = process.env.PORT || 3000;

@@ -224,4 +224,4 @@ function parseMemoryString(value) {
   return Number.isNaN(parsed) ? undefined : parsed * 1024 * 1024;
 }
 
-module.exports = { upgradeRuntime, getBusyContainerCount };
+module.exports = { upgradeRuntime, getBusyContainerCount, buildDockerImage };

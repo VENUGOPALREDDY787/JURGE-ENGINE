@@ -28,7 +28,7 @@ const LANGUAGE_CONFIG = {
   },
   cpp: {
     file:    'main.cpp',
-    compile: 'g++ main.cpp -o main main.cpp',
+    compile: 'g++ main.cpp -o main ',
     run:     '/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- ./main',
   },
   go: {
