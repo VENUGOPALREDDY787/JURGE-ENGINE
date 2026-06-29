@@ -36,14 +36,20 @@ const submissionSchema = new mongoose.Schema(
     expected_output: { type: String, default: null },
 
     // Metrics
-    time:   { type: Number, default: null },  // seconds (float)
-    memory: { type: Number, default: null },  // kilobytes
+    time:         { type: Number, default: null },  // execution time in seconds (float)
+    memory:       { type: Number, default: null },  // peak memory in bytes (cgroup working-set)
+    memoryUsedKB: { type: Number, default: null },  // peak memory in KB (convenience)
+    memoryUsedMB: { type: Number, default: null },  // peak memory in MB (convenience)
 
     // Status object — { id: Number, description: String }
     status: {
       id:          { type: Number, default: 1 },
       description: { type: String, default: 'In Queue' },
     },
+
+    // Webhook settings for asynchronous execution
+    callback_url: { type: String, default: null },
+    metadata:     { type: mongoose.Schema.Types.Mixed, default: null },
   },
   { timestamps: true }
 );

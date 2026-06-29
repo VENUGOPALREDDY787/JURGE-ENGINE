@@ -46,6 +46,33 @@ function verdictToStatus(verdict) {
 }
 
 // ---------------------------------------------------------------------------
+// Trigger Webhook Callback
+// ---------------------------------------------------------------------------
+async function triggerCallback(submission) {
+  if (!submission.callback_url) return;
+  try {
+    const response = await fetch(submission.callback_url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        token:          submission._id.toString(),
+        stdout:         submission.stdout          || null,
+        stderr:         submission.stderr          || null,
+        compile_output: submission.compile_output  || null,
+        message:        submission.message         || null,
+        time:           submission.time != null ? String(Number(submission.time).toFixed(3)) : null,
+        memory:         submission.memory          ?? null,
+        status:         submission.status,
+        metadata:       submission.metadata        || null
+      })
+    });
+    console.log(`📡 Webhook sent to ${submission.callback_url} for submission ${submission._id}. Status: ${response.status}`);
+  } catch (err) {
+    console.error(`❌ Webhook callback failed for submission ${submission._id}:`, err.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Start a BullMQ worker for the given language
 // ---------------------------------------------------------------------------
 function startWorkerForLanguage(lang) {
@@ -80,7 +107,10 @@ function startWorkerForLanguage(lang) {
         submission.message        = result.message        ?? null;
         // timeMs from sandbox is milliseconds; store as fractional seconds
         submission.time           = result.timeMs != null ? result.timeMs / 1000 : null;
-        submission.memory         = result.memory         ?? null;
+        // memory fields — all come from cgroup peak-memory tracker in dockerRunner
+        submission.memory         = result.memory         ?? null;  // bytes
+        submission.memoryUsedKB   = result.memoryUsedKB   ?? null;
+        submission.memoryUsedMB   = result.memoryUsedMB   ?? null;
         submission.status         = verdictToStatus(result.verdict);
 
         // Judge0 expected_output comparison.
@@ -97,10 +127,12 @@ function startWorkerForLanguage(lang) {
         }
 
         await submission.save();
+        await triggerCallback(submission);
       } catch (err) {
         submission.status  = STATUS.INTERNAL_ERROR;
         submission.message = (err && err.message) || String(err);
         await submission.save();
+        await triggerCallback(submission);
         throw err; // re-throw so BullMQ records the failure and can retry
       }
     },

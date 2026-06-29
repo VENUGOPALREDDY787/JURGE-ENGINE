@@ -16,7 +16,9 @@ function toResponse(doc) {
     compile_output: doc.compile_output  || null,
     message:        doc.message         || null,
     time:           doc.time != null ? String(Number(doc.time).toFixed(3)) : null,
-    memory:         doc.memory          ?? null,
+    memory:         doc.memory          ?? null,   // peak bytes
+    memoryUsedKB:   doc.memoryUsedKB    ?? null,
+    memoryUsedMB:   doc.memoryUsedMB    ?? null,
     status:         doc.status,
   };
 }
@@ -45,6 +47,8 @@ function normalizeSubmission(raw) {
       language:        raw.language,
       stdin:           raw.stdin           || '',
       expected_output: raw.expected_output || null,
+      callback_url:    raw.callback_url    || null,
+      metadata:        raw.metadata        || null,
     };
   }
 
@@ -62,6 +66,8 @@ function normalizeSubmission(raw) {
     language,
     stdin:           raw.stdin            || '',
     expected_output: raw.expected_output  || null,
+    callback_url:    raw.callback_url    || null,
+    metadata:        raw.metadata        || null,
   };
 }
 
@@ -80,12 +86,12 @@ exports.createSubmission = async (req, res) => {
       });
     }
 
-    const { sourceCode, language, stdin, expected_output } = normalized;
+    const { sourceCode, language, stdin, expected_output, callback_url, metadata } = normalized;
     if (!sourceCode || !language) {
       return res.status(400).json({ error: 'sourceCode (or source_code) and language (or language_id) are required' });
     }
 
-    const submission = await ExecutionService.createAndEnqueue({ sourceCode, language, stdin, expected_output });
+    const submission = await ExecutionService.createAndEnqueue({ sourceCode, language, stdin, expected_output, callback_url, metadata });
     return res.status(202).json({ token: submission._id });
   } catch (err) {
     console.error(err);
@@ -160,8 +166,8 @@ exports.createBatch = async (req, res) => {
     // Fan out in parallel — each call is independent (own DB doc + queue job).
     // Promise.allSettled so one failure does not abort the others.
     const results = await Promise.allSettled(
-      submissions.map(({ sourceCode, language, stdin, expected_output }) =>
-        ExecutionService.createAndEnqueue({ sourceCode, language, stdin, expected_output })
+      submissions.map(({ sourceCode, language, stdin, expected_output, callback_url, metadata }) =>
+        ExecutionService.createAndEnqueue({ sourceCode, language, stdin, expected_output, callback_url, metadata })
       )
     );
 

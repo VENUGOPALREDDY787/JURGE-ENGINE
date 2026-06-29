@@ -1,8 +1,11 @@
-﻿const config = require('../config');
+'use strict';
+
+const config           = require('../config');
 const containerManager = require('./containerManager');
+const { resetPeakMemory, readPeakMemory } = require('../utils/cgroupMemoryReader');
 
 // ---------------------------------------------------------------------------
-// Per-language compile + run commands
+// Per-language compile + run commands.
 // containerManager.js is NOT modified — all pool/lock/recycle logic is intact.
 // ---------------------------------------------------------------------------
 const LANGUAGE_CONFIG = {
@@ -45,19 +48,29 @@ function parseMemory(value) {
   return Number.isNaN(parsed) ? undefined : parsed * 1024 * 1024;
 }
 
+// Helper: build the three extended memory fields from raw bytes
+function memFields(bytes) {
+  return {
+    memory:       bytes,
+    memoryUsedKB: parseFloat((bytes / 1024).toFixed(2)),
+    memoryUsedMB: parseFloat((bytes / (1024 * 1024)).toFixed(2)),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // runSandbox — acquires a container, copies files, compiles (if needed),
 // runs, cleans up, then releases the container back to the pool.
 //
-// Compile and run are now TWO separate execInContainer calls so that
-// compile errors are captured in `compile_output` and runtime errors
-// are captured in `stderr`, matching the Judge0 response schema.
+// Memory tracking:
+//   A CgroupMemoryTracker is started immediately before `exec run` and
+//   stopped in a finally block. It polls Docker stats (which maps to
+//   cgroup memory.current on the host) every 30 ms to find peak working-set.
+//   If stats are unavailable the tracker silently returns 0 and execution
+//   continues normally — never failing a submission due to tracking errors.
 // ---------------------------------------------------------------------------
 async function runSandbox({ language, sourceCode, stdin }) {
   const lang = LANGUAGE_CONFIG[language];
   if (!lang) throw new Error(`Unsupported language: ${language}`);
-
-  // await containerManager.ensurePool(language);
 
   const memoryBytes = parseMemory(config.sandbox.memory) || 512 * 1024 * 1024;
   const cpuCores    = parseFloat(config.sandbox.cpu || '0.5');
@@ -69,8 +82,12 @@ async function runSandbox({ language, sourceCode, stdin }) {
 
   if (!containerName) throw new Error('no_available_container');
 
-  const startTime    = Date.now();
-  let shouldRecycle  = false;
+  const startTime     = Date.now();
+  let shouldRecycle   = false;
+  // Declared at function scope so all return paths (compile error, success,
+  // runtime error) can read the peak bytes captured during the run step.
+  // Stays 0 if the run step is never reached (compile error path).
+  let peakMemoryBytes = 0;
 
   try {
     // ── Workspace setup ───────────────────────────────────────────────────
@@ -96,8 +113,7 @@ async function runSandbox({ language, sourceCode, stdin }) {
         console.timeEnd('compile');
       } catch (compileErr) {
         console.timeEnd('compile');
-        // Compilation failed — capture error, clean up, return early.
-        // The outer `finally` will still run and call releaseContainer().
+        // Compilation failed — no run step executed, so peakMemoryBytes = 0.
         await containerManager.cleanupWorkspace(containerName).catch(() => {});
         shouldRecycle = await containerManager.incrementUsage(containerName);
         return {
@@ -107,18 +123,30 @@ async function runSandbox({ language, sourceCode, stdin }) {
           message:        null,
           verdict:        'Compilation Error',
           timeMs:         Date.now() - startTime,
-          memory:         0,
+          ...memFields(0),
         };
       }
     }
 
     // ── Step 2: Run ───────────────────────────────────────────────────────
+    // Memory tracking wraps ONLY the execution window (not compile time).
+    // Resets the peak watermark prior to run.
     console.time('run');
-    const execRes = await containerManager.execInContainer(
-      containerName,
-      `${lang.run} < input.txt`,
-      { timeout: config.sandbox.timeoutMs }
-    );
+
+    await resetPeakMemory(containerName).catch(() => {});
+
+    let execRes;
+    try {
+      execRes = await containerManager.execInContainer(
+        containerName,
+        `${lang.run} < input.txt`,
+        { timeout: config.sandbox.timeoutMs }
+      );
+    } finally {
+      // Read peak memory ONCE immediately after process exits but before workspace cleanup
+      peakMemoryBytes = await readPeakMemory(containerName).catch(() => 0);
+    }
+
     console.timeEnd('run');
 
     console.time('cleanup-after');
@@ -134,11 +162,13 @@ async function runSandbox({ language, sourceCode, stdin }) {
       message:        null,
       verdict:        'Accepted',
       timeMs:         Date.now() - startTime,
-      memory:         0,
+      ...memFields(peakMemoryBytes),
     };
 
   } catch (err) {
-    // Runtime error path
+    // Runtime / TLE error path.
+    // peakMemoryBytes is already populated by the inner finally block if the
+    // run step had started before the error was thrown.
     await containerManager.cleanupWorkspace(containerName).catch(() => {});
     return {
       stdout:         err.stdout  || null,
@@ -149,11 +179,11 @@ async function runSandbox({ language, sourceCode, stdin }) {
                         ? 'Time Limit Exceeded'
                         : 'Runtime Error',
       timeMs:         Date.now() - startTime,
-      memory:         0,
+      ...memFields(peakMemoryBytes),
     };
   } finally {
-    // Always release — whether compile failed, runtime errored, or succeeded.
-    // containerManager.js is completely untouched.
+    // Always release the container — compile fail, runtime error, or success.
+    // containerManager.js pool/lock logic is completely untouched.
     if (containerName) {
       await containerManager.releaseContainer(containerName, {
         recycle: shouldRecycle,

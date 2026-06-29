@@ -16,6 +16,7 @@ const files = [
   'src/workers/generic.worker.js',
   'src/workers/launchWorkers.js',
   'src/server.js',
+  'src/utils/cgroupMemoryReader.js',
 ];
 
 let allOk = true;
