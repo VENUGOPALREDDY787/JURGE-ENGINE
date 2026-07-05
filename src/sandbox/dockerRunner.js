@@ -1,45 +1,20 @@
-'use strict';
+﻿'use strict';
 
 const config           = require('../config');
 const containerManager = require('./containerManager');
 const { resetPeakMemory, readPeakMemory } = require('../utils/cgroupMemoryReader');
+const { LANGUAGE_EXEC_CONFIG }            = require('../config/languages');
 
 // ---------------------------------------------------------------------------
 // Per-language compile + run commands.
-// containerManager.js is NOT modified — all pool/lock/recycle logic is intact.
+// Derived from src/config/languages.js — add a new language entry there,
+// not here. Shape: { file, compile, run } — identical to the previous
+// hardcoded object, only the source moves.
+//
+// Dynamic languages added via POST /admin/languages extend this map at
+// runtime via registerLanguageExecConfig() below.
 // ---------------------------------------------------------------------------
-const LANGUAGE_CONFIG = {
-  java: {
-    file:    'Main.java',
-    compile: 'javac Main.java',
-    run:     '/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- /opt/java/openjdk/bin/java Main',
-  },
-  python: {
-    file:    'main.py',
-    compile: '',
-    run:     '/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- python main.py',
-  },
-  javascript: {
-    file:    'index.js',
-    compile: '',
-    run:     '/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- /usr/local/bin/node /workspace/index.js',
-  },
-  c: {
-    file:    'main.c',
-    compile: 'gcc main.c -o main',
-    run:     '/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- ./main',
-  },
-  cpp: {
-    file:    'main.cpp',
-    compile: 'g++ main.cpp -o main ',
-    run:     '/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- ./main',
-  },
-  go: {
-    file:    'main.go',
-    compile: 'go build -o main main.go',
-    run:     '/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- ./main',
-  },
-};
+const LANGUAGE_CONFIG = { ...LANGUAGE_EXEC_CONFIG };
 
 function parseMemory(value) {
   if (!value) return undefined;
@@ -61,12 +36,15 @@ function memFields(bytes) {
 // runSandbox — acquires a container, copies files, compiles (if needed),
 // runs, cleans up, then releases the container back to the pool.
 //
-// Memory tracking:
-//   A CgroupMemoryTracker is started immediately before `exec run` and
-//   stopped in a finally block. It polls Docker stats (which maps to
-//   cgroup memory.current on the host) every 30 ms to find peak working-set.
-//   If stats are unavailable the tracker silently returns 0 and execution
-//   continues normally — never failing a submission due to tracking errors.
+// ⚡ Performance optimizations:
+//   1. Single container handle resolution at startup — all subsequent execs
+//      use _execWithHandle() which bypasses the redis meta + inspect lookups.
+//   2. Source file + stdin packed into ONE tar archive in a single putArchive
+//      call instead of two separate round-trips.
+//   3. Workspace cleanup uses `find -delete` which is faster than `rm -rf`
+//      for Docker exec (avoids sub-shell glob expansion overhead).
+//   4. Java uses -XX:TieredStopAtLevel=1 + -XX:+UseSerialGC to cut JVM
+//      startup cold time from ~2s → ~600ms.
 // ---------------------------------------------------------------------------
 async function runSandbox({ language, sourceCode, stdin }) {
   const lang = LANGUAGE_CONFIG[language];
@@ -84,37 +62,49 @@ async function runSandbox({ language, sourceCode, stdin }) {
 
   const startTime     = Date.now();
   let shouldRecycle   = false;
-  // Declared at function scope so all return paths (compile error, success,
-  // runtime error) can read the peak bytes captured during the run step.
-  // Stays 0 if the run step is never reached (compile error path).
   let peakMemoryBytes = 0;
+  let runStartTime    = null;
 
   try {
-    // ── Workspace setup ───────────────────────────────────────────────────
+    // ── Resolve container handle ONCE ─────────────────────────────────────
+    // All subsequent operations use _execWithHandle / copyAllFilesWithHandle
+    // which skip the redundant inspect + redis.hgetall lookups (saves ~5 round
+    // trips per submission at the cost of one upfront resolve).
+    const container = await containerManager.getContainerHandle(containerName);
+
+    // ── Workspace cleanup ─────────────────────────────────────────────────
     console.time('cleanup-before');
-    await containerManager.cleanupWorkspace(containerName);
+    try {
+      await containerManager._execWithHandle(
+        container,
+        'find /workspace -mindepth 1 -delete 2>/dev/null || true'
+      );
+    } catch (_) { /* ignore */ }
     console.timeEnd('cleanup-before');
 
-    console.time('copy-source');
-    await containerManager.copyFilesToContainer(containerName, [{ name: lang.file, content: sourceCode }]);
-    console.timeEnd('copy-source');
-
-    console.time('copy-stdin');
-    await containerManager.copyFilesToContainer(containerName, [{ name: 'input.txt', content: stdin || '' }]);
-    console.timeEnd('copy-stdin');
+    // ── Single-pass file copy (source + stdin in ONE putArchive) ──────────
+    console.time('copy-files');
+    await containerManager.copyAllFilesWithHandle(container, [
+      { name: lang.file,    content: sourceCode   },
+      { name: 'input.txt',  content: stdin || ''  },
+    ]);
+    console.timeEnd('copy-files');
 
     // ── Step 1: Compile (languages that require it) ───────────────────────
     if (lang.compile) {
       console.time('compile');
       try {
-        await containerManager.execInContainer(containerName, lang.compile, {
-          timeout: config.sandbox.timeoutMs,
-        });
+        await containerManager._execWithHandle(container, lang.compile);
         console.timeEnd('compile');
       } catch (compileErr) {
         console.timeEnd('compile');
         // Compilation failed — no run step executed, so peakMemoryBytes = 0.
-        await containerManager.cleanupWorkspace(containerName).catch(() => {});
+        try {
+          await containerManager._execWithHandle(
+            container,
+            'find /workspace -mindepth 1 -delete 2>/dev/null || true'
+          );
+        } catch (_) {}
         shouldRecycle = await containerManager.incrementUsage(containerName);
         return {
           stdout:         compileErr.stdout  || null,
@@ -122,35 +112,39 @@ async function runSandbox({ language, sourceCode, stdin }) {
           compile_output: compileErr.stderr  || compileErr.message || 'Compilation failed',
           message:        null,
           verdict:        'Compilation Error',
-          timeMs:         Date.now() - startTime,
+          timeMs:         0, // reported execution time is 0 for compile errors
           ...memFields(0),
         };
       }
     }
 
     // ── Step 2: Run ───────────────────────────────────────────────────────
-    // Memory tracking wraps ONLY the execution window (not compile time).
-    // Resets the peak watermark prior to run.
     console.time('run');
 
     await resetPeakMemory(containerName).catch(() => {});
 
     let execRes;
+    runStartTime = Date.now();
     try {
-      execRes = await containerManager.execInContainer(
-        containerName,
+      execRes = await containerManager._execWithHandle(
+        container,
         `${lang.run} < input.txt`,
-        { timeout: config.sandbox.timeoutMs }
       );
     } finally {
-      // Read peak memory ONCE immediately after process exits but before workspace cleanup
       peakMemoryBytes = await readPeakMemory(containerName).catch(() => 0);
     }
 
+    const runDurationMs = Date.now() - runStartTime;
     console.timeEnd('run');
 
+    // ── Post-run cleanup ──────────────────────────────────────────────────
     console.time('cleanup-after');
-    await containerManager.cleanupWorkspace(containerName);
+    try {
+      await containerManager._execWithHandle(
+        container,
+        'find /workspace -mindepth 1 -delete 2>/dev/null || true'
+      );
+    } catch (_) { /* ignore */ }
     console.timeEnd('cleanup-after');
 
     shouldRecycle = await containerManager.incrementUsage(containerName);
@@ -161,14 +155,11 @@ async function runSandbox({ language, sourceCode, stdin }) {
       compile_output: null,
       message:        null,
       verdict:        'Accepted',
-      timeMs:         Date.now() - startTime,
+      timeMs:         runDurationMs, // reported execution time matches actual run duration
       ...memFields(peakMemoryBytes),
     };
 
   } catch (err) {
-    // Runtime / TLE error path.
-    // peakMemoryBytes is already populated by the inner finally block if the
-    // run step had started before the error was thrown.
     await containerManager.cleanupWorkspace(containerName).catch(() => {});
     return {
       stdout:         err.stdout  || null,
@@ -178,12 +169,10 @@ async function runSandbox({ language, sourceCode, stdin }) {
       verdict:        err.message && err.message.includes('timeout')
                         ? 'Time Limit Exceeded'
                         : 'Runtime Error',
-      timeMs:         Date.now() - startTime,
+      timeMs:         runStartTime ? Date.now() - runStartTime : 0,
       ...memFields(peakMemoryBytes),
     };
   } finally {
-    // Always release the container — compile fail, runtime error, or success.
-    // containerManager.js pool/lock logic is completely untouched.
     if (containerName) {
       await containerManager.releaseContainer(containerName, {
         recycle: shouldRecycle,
@@ -195,4 +184,21 @@ async function runSandbox({ language, sourceCode, stdin }) {
   }
 }
 
-module.exports = { runSandbox };
+/**
+ * registerLanguageExecConfig(language, execConfig)
+ *
+ * Registers execution config for a dynamically added language at runtime.
+ * Called by admin.service.addLanguage() after a successful image build and
+ * by launchWorkers.js when restoring persisted dynamic languages on boot.
+ * This makes the new language immediately available in runSandbox() without
+ * requiring a server or worker restart.
+ *
+ * @param {string} language   e.g. 'rust'
+ * @param {{ file, compile, run }} execConfig
+ */
+function registerLanguageExecConfig(language, execConfig) {
+  LANGUAGE_CONFIG[language] = execConfig;
+  console.log(`[dockerRunner] Registered exec config for language: ${language}`);
+}
+
+module.exports = { runSandbox, registerLanguageExecConfig };

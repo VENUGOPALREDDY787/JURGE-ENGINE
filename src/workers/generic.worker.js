@@ -7,7 +7,7 @@
  */
 const { Worker } = require('bullmq');
 const config = require('../config');
-const { getSubmissionModel, STATUS } = require('../models/Submission');
+const { getSubmissionModel, getUnifiedModel, STATUS } = require('../models/Submission');
 const dockerRunner = require('../sandbox/dockerRunner');
 
 // ---------------------------------------------------------------------------
@@ -79,8 +79,8 @@ function startWorkerForLanguage(lang) {
   const queueName = `${lang}-queue`;
   const concurrency = getConcurrencyForLanguage(lang);
 
-  // Obtain the model for the language-specific collection once per worker
-  const SubmissionModel = getSubmissionModel(lang);
+  // Obtain the unified model for fast O(1) submission lookup
+  const UnifiedModel = getUnifiedModel();
 
   const worker = new Worker(
     queueName,
@@ -88,7 +88,13 @@ function startWorkerForLanguage(lang) {
       // job.data contains only submissionId — full payload is fetched from MongoDB.
       const { submissionId } = job.data;
 
-      const submission = await SubmissionModel.findById(submissionId);
+      // Try unified collection first (new submissions), fall back to per-language
+      // collection for submissions created before the unified collection existed.
+      let submission = await UnifiedModel.findById(submissionId);
+      if (!submission) {
+        const PerLangModel = getSubmissionModel(lang);
+        submission = await PerLangModel.findById(submissionId);
+      }
       if (!submission) throw new Error('submission_missing');
 
       // Read execution payload from the persisted document (not from Redis)

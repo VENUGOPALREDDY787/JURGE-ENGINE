@@ -1,13 +1,15 @@
 require('dotenv').config();
 
-const SUPPORTED_LANGUAGES = {
-  java: 'java',
-  python: 'python',
-  javascript: 'javascript',
-  c: 'c',
-  cpp: 'cpp',
-  go: 'go'
-};
+// Import language definitions from the single source of truth.
+// supportedLanguages is derived automatically — no manual sync needed.
+const { SUPPORTED_LANGUAGE_IDS } = require('./languages');
+
+// Build the { key: key } map that the rest of the codebase expects.
+// e.g. { java: 'java', python: 'python', ... }
+const SUPPORTED_LANGUAGES = {};
+for (const id of SUPPORTED_LANGUAGE_IDS) {
+  SUPPORTED_LANGUAGES[id] = id;
+}
 
 module.exports = {
   port: process.env.PORT || 3000,

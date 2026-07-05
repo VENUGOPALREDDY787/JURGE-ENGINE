@@ -3,6 +3,7 @@ const Redis = require('ioredis');
 const crypto = require('crypto');
 const tar = require('tar-stream');
 const config = require('../config');
+const { LANGUAGE_IMAGE_MAP: STATIC_LANGUAGE_IMAGE_MAP } = require('../config/languages');
 
 const docker = new Docker();
 const redis = new Redis({ host: config.redis.host, port: config.redis.port, password: config.redis.password });
@@ -10,14 +11,9 @@ const CONTAINER_PREFIX = 'judge-';
 const LOCK_TTL = 30000;
 const RECYCLE_THRESHOLD = config.containerRecycleThreshold || parseInt(process.env.CONTAINER_RECYCLE_THRESHOLD || '20', 10);
 
-const LANGUAGE_IMAGE_MAP = {
-  java: 'judge-java-nsjail',
-  python: 'judge-python-nsjail',
-  javascript: 'judge-node-nsjail',
-  c: 'judge-c-nsjail',
-  cpp: 'judge-cpp-nsjail',
-  go: 'judge-go-nsjail'
-};
+// Mutable map — starts with static languages from languages.js.
+// Dynamic languages (registered at runtime via registerLanguage()) are added here.
+const LANGUAGE_IMAGE_MAP = { ...STATIC_LANGUAGE_IMAGE_MAP };
 
 // ---------------------------------------------------------------------------
 // getMinPoolSize / getMaxPoolSize
@@ -112,6 +108,36 @@ async function inspectContainer(containerName) {
 
     return { container, info };
   } catch (e) {
+    if (e.statusCode === 404) {
+      return null;
+    }
+
+    console.warn(`[inspectContainer] Transient error inspecting ${containerName}: ${e.message}. Retrying...`);
+
+    // Retry up to 3 times for transient Docker API errors (common under load on Windows)
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await new Promise((r) => setTimeout(r, 150 * attempt));
+      try {
+        const container = docker.getContainer(containerName);
+        let info = await container.inspect();
+
+        if (!info.State.Running) {
+          console.log(`STARTING STOPPED CONTAINER (RETRY ${attempt}): ${containerName}`);
+          await container.start();
+          info = await container.inspect();
+        }
+
+        return { container, info };
+      } catch (retryErr) {
+        if (retryErr.statusCode === 404) {
+          return null;
+        }
+        if (attempt === 3) {
+          console.error(`[inspectContainer] Failed all retries for ${containerName}: ${retryErr.message}`);
+          return null;
+        }
+      }
+    }
     return null;
   }
 }
@@ -247,6 +273,14 @@ async function popFreeContainer(language) {
       continue;
     }
 
+    // Verify container actually exists and is running in Docker
+    const inspected = await inspectContainer(containerName);
+    if (!inspected) {
+      console.log(`[popFreeContainer] Container ${containerName} missing in Docker, cleaning up records`);
+      await removeContainerRecords(containerName);
+      continue;
+    }
+
     const now = new Date().toISOString();
 
     await redis.hmset(getMetaKey(containerName), {
@@ -329,32 +363,6 @@ if (existingCount < poolConfig.maxPoolSize) {
 
   return created.name;
 }
-      console.log("MAX POOL SIZE:", poolConfig.maxPoolSize);
-      console.log("EXISTING:", existing.length);
-
-      if (existing.length < poolConfig.maxPoolSize) {
-        const index = getFirstAvailableIndex(
-          existing,
-          poolConfig.maxPoolSize
-        );
-
-        const containerName = containerNameFor(language, index);
-
-        console.log("CREATING:", containerName);
-
-        const created = await createContainer(
-          containerName,
-          poolConfig.image,
-          opts
-        );
-
-        await redis.hmset(getMetaKey(containerName), {
-          status: "busy",
-          lastUsed: now
-        });
-
-        return created.name;
-      }
     } finally {
       await releaseLock(lock);
     }
@@ -493,16 +501,35 @@ async function copyFilesToContainer(containerName, files) {
   await meta.container.putArchive(pack, { path: '/workspace' });
 }
 
-async function execInContainer(containerName, cmd, opts = {}) {
+// Fast variant: accepts an already-resolved container handle, packs ALL files
+// in a single tar archive and uploads in ONE putArchive call.
+async function copyAllFilesWithHandle(container, files) {
+  const pack = tar.pack();
+  for (const f of files) {
+    pack.entry({ name: f.name, mode: 0o644 }, f.content);
+  }
+  pack.finalize();
+  await container.putArchive(pack, { path: '/workspace' });
+}
+
+// Returns the raw container handle (Dockerode Container object) without the
+// overhead of redis meta lookup — used by dockerRunner for perf-critical paths.
+async function getContainerHandle(containerName) {
   const meta = await getContainerInfo(containerName);
   if (!meta) throw new Error('container_missing');
+  return meta.container;
+}
 
-  const execInstance = await meta.container.exec({
-    Cmd: ['sh', '-lc', cmd],
+// Internal: run a command given an already-resolved container handle.
+// Avoids a redundant inspectContainer + redis.hgetall on every exec call.
+// Uses a standard shell (sh -c) instead of login shell (sh -lc) to avoid profile loading overhead (~20ms).
+async function _execWithHandle(container, cmd) {
+  const execInstance = await container.exec({
+    Cmd:          ['sh', '-c', cmd],
     AttachStdout: true,
     AttachStderr: true,
-    Tty: false,
-    WorkingDir: '/workspace'
+    Tty:          false,
+    WorkingDir:   '/workspace'
   });
 
   const stream = await execInstance.start({ hijack: true, stdin: false });
@@ -511,7 +538,7 @@ async function execInContainer(containerName, cmd, opts = {}) {
     const stdout = [];
     const stderr = [];
 
-    meta.container.modem.demuxStream(stream, {
+    container.modem.demuxStream(stream, {
       write: (chunk) => stdout.push(chunk)
     }, {
       write: (chunk) => stderr.push(chunk)
@@ -536,9 +563,19 @@ async function execInContainer(containerName, cmd, opts = {}) {
   });
 }
 
+// Public: resolves the container handle once then delegates to _execWithHandle.
+async function execInContainer(containerName, cmd, opts = {}) {
+  const meta = await getContainerInfo(containerName);
+  if (!meta) throw new Error('container_missing');
+  return _execWithHandle(meta.container, cmd);
+}
+
 async function cleanupWorkspace(containerName) {
+  const meta = await getContainerInfo(containerName);
+  if (!meta) return;
   try {
-    await execInContainer(containerName, 'rm -rf /workspace/* || true');
+    // Faster than rm -rf: list entries then remove; avoid spawning a sub-shell glob
+    await _execWithHandle(meta.container, 'find /workspace -mindepth 1 -delete 2>/dev/null || true');
   } catch (e) {
     console.error(`Cleanup failed for ${containerName}:`, e.message);
   }
@@ -649,6 +686,13 @@ async function scaleDownPool(language) {
     );
 
     for (const name of toRemove) {
+      // Try to remove it from the free list atomically to avoid race conditions with popping workers
+      const removed = await redis.lrem(getFreeKey(language), 0, name);
+      if (removed === 0) {
+        console.log(`[autoscale] ${language}: container ${name} already popped, skipping scale-down for it`);
+        continue;
+      }
+
       const inspected = await inspectContainer(name);
       if (inspected) {
         try { await inspected.container.stop({ t: 1 }); }          catch (e) { /* ignore */ }
@@ -703,7 +747,10 @@ module.exports = {
   acquireContainer,
   releaseContainer,
   copyFilesToContainer,
+  copyAllFilesWithHandle,
+  getContainerHandle,
   execInContainer,
+  _execWithHandle,
   cleanupWorkspace,
   incrementUsage,
   drainLanguagePool,

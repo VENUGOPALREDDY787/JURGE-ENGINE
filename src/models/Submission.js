@@ -57,7 +57,7 @@ const submissionSchema = new mongoose.Schema(
 submissionSchema.index({ createdAt: 1 });
 
 // ---------------------------------------------------------------------------
-// Per-language model factory
+// Per-language model factory (PRESERVED for backward compatibility)
 // Caches models so mongoose doesn't re-compile the schema on every call.
 // Collection name format:  <language>_submissions
 //   e.g. java → java_submissions, python → python_submissions
@@ -72,4 +72,20 @@ function getSubmissionModel(language) {
   return modelCache[language];
 }
 
-module.exports = { getSubmissionModel, STATUS };
+// ---------------------------------------------------------------------------
+// Unified model (Task 3 — Single Collection)
+// All new submissions are written to 'submissions' regardless of language.
+// The language field on the document is used to differentiate them.
+// Old submissions (in per-language collections) are still accessible via
+// getSubmissionModel() as a fallback in the GET endpoints.
+// ---------------------------------------------------------------------------
+let _unifiedModel = null;
+
+function getUnifiedModel() {
+  if (_unifiedModel) return _unifiedModel;
+  // Use a distinct model name to avoid mongoose re-registration errors
+  _unifiedModel = mongoose.model('UnifiedSubmission', submissionSchema, 'submissions');
+  return _unifiedModel;
+}
+
+module.exports = { getSubmissionModel, getUnifiedModel, STATUS };

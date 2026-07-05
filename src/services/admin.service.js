@@ -198,19 +198,38 @@ async function updateRuntime(language, baseImage) {
  *
  * @param {{ language, fileName, compileCommand, runCommand, dockerfile }} opts
  */
-async function addLanguage({ language, fileName, compileCommand, runCommand, dockerfile }) {
+async function addLanguage({ language, fileName, compileCommand, runCommand, dockerfile, baseImage }) {
   const imageName = `judge-${language}-nsjail`;
   let buildLog    = '';
 
-  // 1. Persist with building status (allows progress tracking)
-  await LanguageConfig.create({
-    language, imageName, fileName, compileCommand, runCommand, status: 'building',
-  });
+  const fs = require('fs');
+  const path = require('path');
+  const { generateDockerfile } = require('../utils/dockerfileGenerator');
+
+  let finalDockerfile = dockerfile;
+  if (!finalDockerfile) {
+    finalDockerfile = generateDockerfile(language, baseImage);
+  }
+
+  // Save Dockerfile to disk for audit/manual reproduction
+  const dockerDir = path.join(__dirname, '../../docker');
+  if (!fs.existsSync(dockerDir)) {
+    fs.mkdirSync(dockerDir, { recursive: true });
+  }
+  const dockerfilePath = path.join(dockerDir, `${language}.Dockerfile`);
+  fs.writeFileSync(dockerfilePath, finalDockerfile, 'utf8');
+
+  // 1. Persist with building status (allows progress tracking, safe from duplicate key errors on retry)
+  await LanguageConfig.findOneAndUpdate(
+    { language },
+    { imageName, fileName, compileCommand, runCommand, status: 'building', buildLog: '' },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
 
   try {
-    // 2. Build Docker image from the provided Dockerfile string (blocking)
+    // 2. Build Docker image from the Dockerfile (blocking)
     console.log(`[admin] Building Docker image ${imageName} for new language: ${language}`);
-    buildLog = await runtimeService.buildDockerImage(imageName, dockerfile);
+    buildLog = await runtimeService.buildDockerImage(imageName, finalDockerfile);
     console.log(`[admin] Image build complete for ${language}`);
 
     // 3. Register Runtime document for status/version tracking

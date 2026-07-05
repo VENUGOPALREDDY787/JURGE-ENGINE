@@ -1,5 +1,5 @@
 const ExecutionService = require('../services/execution.service.js');
-const { getSubmissionModel } = require('../models/Submission');
+const { getSubmissionModel, getUnifiedModel } = require('../models/Submission');
 const langRegistry   = require('../utils/languageRegistry');
 const { resolveLanguageId } = require('../config/judge0LanguageMap');
 
@@ -101,13 +101,20 @@ exports.createSubmission = async (req, res) => {
 
 // ---------------------------------------------------------------------------
 // GET /api/submissions/:id
-// Searches across all per-language collections sequentially (at most 6
-// indexed findById calls). Returns the first match serialized as Judge0 shape.
+// Checks the unified 'submissions' collection first (O(1) indexed _id lookup).
+// Falls back to per-language collections for tokens created before the unified
+// collection existed, ensuring zero regression for existing tokens.
 // ---------------------------------------------------------------------------
 exports.getSubmission = async (req, res) => {
   try {
     const { id } = req.params;
 
+    // 1. Try unified collection first — fast single indexed lookup
+    const unified = getUnifiedModel();
+    const unifiedDoc = await unified.findById(id).lean();
+    if (unifiedDoc) return res.json(toResponse(unifiedDoc));
+
+    // 2. Fallback: search per-language collections for pre-migration tokens
     const ALL_LANGS = langRegistry.getAll();
     for (const lang of ALL_LANGS) {
       const Model = getSubmissionModel(lang);
@@ -195,11 +202,9 @@ exports.createBatch = async (req, res) => {
 // Query: ?tokens=token1,token2,token3
 //
 // Strategy:
-//   - Query each per-language collection ONCE using $in on the full token list.
-//     This is O(L) DB round-trips (L = number of languages, typically 6)
-//     instead of O(N×L) individual findById calls.
-//   - Results are indexed by _id string for O(1) lookup.
-//   - Final array re-ordered to match the original token order.
+//   - Query the unified 'submissions' collection with $in in ONE round-trip.
+//   - Fall back to per-language collections for any tokens not found (old tokens).
+//   - Results re-ordered to match original token order.
 // ---------------------------------------------------------------------------
 exports.getBatch = async (req, res) => {
   try {
@@ -217,20 +222,30 @@ exports.getBatch = async (req, res) => {
       return res.status(400).json({ error: 'token count exceeds maximum of 500' });
     }
 
-    // Query each language collection once with $in — one round-trip per language
-    const perLangResults = await Promise.all(
-      langRegistry.getAll().map((lang) =>
-        getSubmissionModel(lang)
-          .find({ _id: { $in: tokens } })
-          .lean()
-      )
-    );
+    // 1. Single round-trip to unified collection
+    const unified = getUnifiedModel();
+    const unifiedDocs = await unified.find({ _id: { $in: tokens } }).lean();
 
-    // Flatten all results and index by string id for O(1) lookup
+    // Index by _id string for O(1) lookup
     const docById = {};
-    for (const docs of perLangResults) {
-      for (const doc of docs) {
-        docById[String(doc._id)] = doc;
+    for (const doc of unifiedDocs) {
+      docById[String(doc._id)] = doc;
+    }
+
+    // 2. Find any tokens not in unified collection (pre-migration tokens)
+    const missing = tokens.filter((t) => !docById[t]);
+    if (missing.length > 0) {
+      const perLangResults = await Promise.all(
+        langRegistry.getAll().map((lang) =>
+          getSubmissionModel(lang)
+            .find({ _id: { $in: missing } })
+            .lean()
+        )
+      );
+      for (const docs of perLangResults) {
+        for (const doc of docs) {
+          docById[String(doc._id)] = doc;
+        }
       }
     }
 
@@ -238,7 +253,6 @@ exports.getBatch = async (req, res) => {
     const submissions = tokens.map((token) => {
       const doc = docById[token];
       if (!doc) {
-        // Token not found — minimal not-found entry (mirrors Judge0 behaviour)
         return { token, status: { id: 0, description: 'Not Found' } };
       }
       return toResponse(doc);

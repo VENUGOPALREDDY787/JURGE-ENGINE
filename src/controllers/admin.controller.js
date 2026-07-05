@@ -150,14 +150,13 @@ exports.getRuntimeStatus = async (req, res) => {
  */
 exports.addLanguage = async (req, res) => {
   try {
-    const { language, fileName, compileCommand, runCommand, dockerfile } = req.body;
+    const { language, fileName, compileCommand, runCommand, dockerfile, baseImage } = req.body;
 
     // Validate required fields
     const missing = [];
     if (!language)   missing.push('language');
     if (!fileName)   missing.push('fileName');
     if (!runCommand) missing.push('runCommand');
-    if (!dockerfile) missing.push('dockerfile');
     if (missing.length > 0) {
       return res.status(400).json({
         error:   'missing_fields',
@@ -179,6 +178,7 @@ exports.addLanguage = async (req, res) => {
       compileCommand: compileCommand || '',
       runCommand,
       dockerfile,
+      baseImage,
     });
 
     return res.status(201).json(result);

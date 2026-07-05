@@ -9,9 +9,11 @@
  * copy. The worker process syncs via Redis pub/sub (jurge:new-language channel)
  * and MongoDB persistence on restart.
  */
-const config = require('../config');
+const { SUPPORTED_LANGUAGE_IDS } = require('../config/languages');
 
-const _registry = new Set(Object.values(config.supportedLanguages));
+// Start with all statically configured languages.
+// Grows at runtime when new languages are added via POST /admin/languages.
+const _registry = new Set(SUPPORTED_LANGUAGE_IDS);
 
 /**
  * Check whether a language is currently supported.

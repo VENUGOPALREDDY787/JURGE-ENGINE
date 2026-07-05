@@ -1,13 +1,11 @@
-const { getSubmissionModel, STATUS } = require('../models/Submission');
+const { getSubmissionModel, getUnifiedModel, STATUS } = require('../models/Submission');
 const queueService = require('./queue.service');
 const langRegistry = require('../utils/languageRegistry');
 
 async function createAndEnqueue({ sourceCode, language, stdin, expected_output, callback_url, metadata }) {
   if (!langRegistry.isSupported(language)) throw new Error('unsupported_language');
 
-  // Route to the language-specific collection via the factory
-  const SubmissionModel = getSubmissionModel(language);
-  const submission = await SubmissionModel.create({
+  const payload = {
     sourceCode,
     language,
     stdin,
@@ -15,6 +13,21 @@ async function createAndEnqueue({ sourceCode, language, stdin, expected_output, 
     status: STATUS.IN_QUEUE,
     callback_url: callback_url || null,
     metadata: metadata || null,
+  };
+
+  // ── Primary write: unified 'submissions' collection (Task 3) ─────────────
+  // All new submissions land here regardless of language. A single indexed
+  // _id lookup is all that's needed to fetch any token from this point on.
+  const unified    = getUnifiedModel();
+  const submission = await unified.create(payload);
+
+  // ── Secondary write: per-language collection (backward compatibility) ─────
+  // Preserves existing per-language collections so any external tooling or
+  // admin queries that read java_submissions / python_submissions still work.
+  // Written asynchronously — failure here does NOT fail the submission.
+  const PerLangModel = getSubmissionModel(language);
+  PerLangModel.create({ ...payload, _id: submission._id }).catch((err) => {
+    console.warn(`[execution] Per-lang write failed for ${language}:`, err.message);
   });
 
   const q = queueService.getQueueForLanguage(language);

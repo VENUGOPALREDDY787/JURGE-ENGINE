@@ -4,12 +4,13 @@ const mongoose      = require('mongoose');
 const { Queue }     = require('bullmq');
 const Redis         = require('ioredis');
 const config        = require('../config');
-const { startWorkerForLanguage } = require('./generic.worker');
-const { scaleDownPool }          = require('../sandbox/containerManager');
-const containerManager           = require('../sandbox/containerManager');
-const queueService               = require('../services/queue.service');
-const langRegistry               = require('../utils/languageRegistry');
-const LanguageConfig             = require('../models/LanguageConfig');
+const { startWorkerForLanguage }    = require('./generic.worker');
+const containerManager              = require('../sandbox/containerManager');
+const dockerRunner                  = require('../sandbox/dockerRunner');
+const queueService                  = require('../services/queue.service');
+const langRegistry                  = require('../utils/languageRegistry');
+const LanguageConfig                = require('../models/LanguageConfig');
+const { startScaleWatcher }         = require('../autoscaling/workerScaler');
 
 const LANGS = Object.values(config.supportedLanguages);
 
@@ -40,6 +41,12 @@ async function launch() {
       const { language, imageName } = lc;
       if (langRegistry.isSupported(language)) continue; // already in static config
 
+      // Register exec config so dockerRunner knows how to compile/run this language
+      dockerRunner.registerLanguageExecConfig(language, {
+        file:    lc.fileName,
+        compile: lc.compileCommand,
+        run:     lc.runCommand,
+      });
       containerManager.registerLanguage(language, imageName);
       queueService.createQueue(language);
       langRegistry.register(language);
@@ -51,27 +58,14 @@ async function launch() {
     // Non-fatal — statically configured languages continue working normally
   }
 
-  // ── Background idle-based auto scale-down watcher ─────────────────────────
+  // ── Start idle scale-down watchers via dedicated workerScaler module ──────
+  // Extracted from inline setInterval. Future scale-up policies can be
+  // added to src/autoscaling/workerScaler.js without touching this launcher.
   const scaleDownInterval = config.pool.scaleDownInterval;
 
   LANGS.forEach((lang) => {
     const monitorQueue = new Queue(`${lang}-queue`, { connection: redisConn });
-
-    const timer = setInterval(async () => {
-      try {
-        const [waiting, active] = await Promise.all([
-          monitorQueue.getWaitingCount(),
-          monitorQueue.getActiveCount(),
-        ]);
-        if (waiting === 0 && active === 0) {
-          await scaleDownPool(lang);
-        }
-      } catch (err) {
-        console.warn(`[autoscale] Check failed for ${lang}:`, err.message);
-      }
-    }, scaleDownInterval);
-
-    timer.unref();
+    startScaleWatcher(lang, monitorQueue, { intervalMs: scaleDownInterval });
   });
 
   console.log(`[autoscale] Idle scale-down watcher active (interval: ${scaleDownInterval}ms)`);
@@ -104,17 +98,27 @@ async function launch() {
     console.log(`[dynamic] Received pub/sub: starting worker for '${language}'`);
 
     try {
-      // Fetch the image name from MongoDB (set by admin.service.addLanguage)
+      // Fetch the image name + exec config from MongoDB (set by admin.service.addLanguage)
       const lc = await LanguageConfig.findOne({ language, status: 'active' }).lean();
       if (!lc) {
         console.warn(`[dynamic] No active LanguageConfig for '${language}' — cannot start worker`);
         return;
       }
 
+      // Register exec config so dockerRunner knows how to compile/run this language
+      dockerRunner.registerLanguageExecConfig(language, {
+        file:    lc.fileName,
+        compile: lc.compileCommand,
+        run:     lc.runCommand,
+      });
       containerManager.registerLanguage(language, lc.imageName);
       queueService.createQueue(language);
       langRegistry.register(language);
       startWorkerForLanguage(language);
+
+      // Also start a scale watcher for the newly added language
+      const monitorQueue = new Queue(`${language}-queue`, { connection: redisConn });
+      startScaleWatcher(language, monitorQueue, { intervalMs: scaleDownInterval });
 
       console.log(`[dynamic] Worker started for new language: ${language}`);
     } catch (err) {
