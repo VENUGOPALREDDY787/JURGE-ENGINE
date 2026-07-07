@@ -181,8 +181,13 @@ async function readPeakMemory(containerName) {
 
   // ── Strategy 3: Docker stats API (single call, no polling) ───────────────
   // Last resort — reads CURRENT memory (not peak), but better than 0.
-  // On cgroup v2 hosts where the host cgroup path is inaccessible (e.g. running
-  // the engine inside Docker itself) this is the only usable fallback.
+  // We only run this fallback if ENABLE_DOCKER_STATS_FALLBACK=true since
+  // calling container.stats() takes ~1 second on non-Linux development hosts.
+  if (process.env.ENABLE_DOCKER_STATS_FALLBACK !== 'true') {
+    console.log('[memory] Skipping Docker stats API fallback on non-Linux host (to maximize speed)');
+    return 0;
+  }
+
   console.log('[memory] Falling back to Docker stats API (single read, current usage)');
   try {
     const container = docker.getContainer(containerName);

@@ -218,7 +218,11 @@ async function createContainer(containerName, image, opts = {}) {
       NetworkMode: 'none',
       ReadonlyRootfs: false,
       SecurityOpt: ['no-new-privileges'],
-      Privileged: true
+      Privileged: true,
+      Tmpfs: {
+        '/workspace': 'rw,exec,nosuid,size=128m',
+        '/tmp': 'rw,exec,nosuid,size=128m'
+      }
     }
   };
 
@@ -553,6 +557,7 @@ async function _execWithHandle(container, cmd) {
         const error = new Error(stderrText || `Exit code ${inspect.ExitCode}`);
         error.stdout = stdoutText;
         error.stderr = stderrText;
+        error.exitCode = inspect.ExitCode;
         return reject(error);
       }
 

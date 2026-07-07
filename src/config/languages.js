@@ -34,7 +34,7 @@ const LANGUAGE_DEFINITIONS = [
     dockerImage:    'judge-python-nsjail',
     fileName:       'main.py',
     compileCommand: '',
-    runCommand:     '/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- python main.py',
+    runCommand:     '/opt/nsjail/nsjail -Q --disable_clone_newns --cwd /workspace -- /usr/local/bin/python main.py',
   },
   {
     languageId:     'javascript',

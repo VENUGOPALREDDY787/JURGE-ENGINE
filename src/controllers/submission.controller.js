@@ -57,7 +57,11 @@ function normalizeSubmission(raw) {
   if (!language && raw.language_id != null) {
     language = resolveLanguageId(raw.language_id);
     if (!language) {
-      return { _unknownLanguageId: raw.language_id };
+      if (typeof raw.language_id === 'string' && langRegistry.isSupported(raw.language_id)) {
+        language = raw.language_id;
+      } else {
+        return { _unknownLanguageId: raw.language_id };
+      }
     }
   }
 

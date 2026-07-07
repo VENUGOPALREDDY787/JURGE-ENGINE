@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 
 const config           = require('../config');
 const containerManager = require('./containerManager');
@@ -67,85 +67,44 @@ async function runSandbox({ language, sourceCode, stdin }) {
 
   try {
     // ── Resolve container handle ONCE ─────────────────────────────────────
-    // All subsequent operations use _execWithHandle / copyAllFilesWithHandle
-    // which skip the redundant inspect + redis.hgetall lookups (saves ~5 round
-    // trips per submission at the cost of one upfront resolve).
     const container = await containerManager.getContainerHandle(containerName);
 
-    // ── Workspace cleanup ─────────────────────────────────────────────────
-    console.time('cleanup-before');
-    try {
-      await containerManager._execWithHandle(
-        container,
-        'find /workspace -mindepth 1 -delete 2>/dev/null || true'
-      );
-    } catch (_) { /* ignore */ }
-    console.timeEnd('cleanup-before');
-
-    // ── Single-pass file copy (source + stdin in ONE putArchive) ──────────
-    console.time('copy-files');
-    await containerManager.copyAllFilesWithHandle(container, [
-      { name: lang.file,    content: sourceCode   },
-      { name: 'input.txt',  content: stdin || ''  },
-    ]);
-    console.timeEnd('copy-files');
-
-    // ── Step 1: Compile (languages that require it) ───────────────────────
-    if (lang.compile) {
-      console.time('compile');
-      try {
-        await containerManager._execWithHandle(container, lang.compile);
-        console.timeEnd('compile');
-      } catch (compileErr) {
-        console.timeEnd('compile');
-        // Compilation failed — no run step executed, so peakMemoryBytes = 0.
-        try {
-          await containerManager._execWithHandle(
-            container,
-            'find /workspace -mindepth 1 -delete 2>/dev/null || true'
-          );
-        } catch (_) {}
-        shouldRecycle = await containerManager.incrementUsage(containerName);
-        return {
-          stdout:         compileErr.stdout  || null,
-          stderr:         null,
-          compile_output: compileErr.stderr  || compileErr.message || 'Compilation failed',
-          message:        null,
-          verdict:        'Compilation Error',
-          timeMs:         0, // reported execution time is 0 for compile errors
-          ...memFields(0),
-        };
-      }
-    }
-
-    // ── Step 2: Run ───────────────────────────────────────────────────────
+    // ── Unified Compile + Run + Cleanup Execution ─────────────────────────
     console.time('run');
-
     await resetPeakMemory(containerName).catch(() => {});
+
+    // Encode sourceCode and stdin to base64 to write files inline in the exec script safely
+    const base64Source = Buffer.from(sourceCode).toString('base64');
+    const base64Stdin  = Buffer.from(stdin || '').toString('base64');
+
+    let cmd = `echo '${base64Source}' | base64 -d > /workspace/${lang.file}
+echo '${base64Stdin}' | base64 -d > /workspace/input.txt
+`;
+
+    if (lang.compile) {
+      cmd += `if ${lang.compile} > /tmp/compile.out 2>&1; then
+  ${lang.run} < /workspace/input.txt
+  status=$?
+else
+  cat /tmp/compile.out >&2
+  status=254
+fi
+find /workspace -mindepth 1 -delete 2>/dev/null || true
+exit $status`;
+    } else {
+      cmd += `${lang.run} < /workspace/input.txt
+status=$?
+find /workspace -mindepth 1 -delete 2>/dev/null || true
+exit $status`;
+    }
 
     let execRes;
     runStartTime = Date.now();
-    try {
-      execRes = await containerManager._execWithHandle(
-        container,
-        `${lang.run} < input.txt`,
-      );
-    } finally {
-      peakMemoryBytes = await readPeakMemory(containerName).catch(() => 0);
-    }
-
+    execRes = await containerManager._execWithHandle(container, cmd);
     const runDurationMs = Date.now() - runStartTime;
     console.timeEnd('run');
 
-    // ── Post-run cleanup ──────────────────────────────────────────────────
-    console.time('cleanup-after');
-    try {
-      await containerManager._execWithHandle(
-        container,
-        'find /workspace -mindepth 1 -delete 2>/dev/null || true'
-      );
-    } catch (_) { /* ignore */ }
-    console.timeEnd('cleanup-after');
+    peakMemoryBytes = await readPeakMemory(containerName).catch(() => 0);
 
     shouldRecycle = await containerManager.incrementUsage(containerName);
 
@@ -155,12 +114,27 @@ async function runSandbox({ language, sourceCode, stdin }) {
       compile_output: null,
       message:        null,
       verdict:        'Accepted',
-      timeMs:         runDurationMs, // reported execution time matches actual run duration
+      timeMs:         runDurationMs,
       ...memFields(peakMemoryBytes),
     };
 
   } catch (err) {
+    // Guarantee cleanup in case of unexpected execution failures
     await containerManager.cleanupWorkspace(containerName).catch(() => {});
+    shouldRecycle = await containerManager.incrementUsage(containerName);
+
+    if (err.exitCode === 254) {
+      return {
+        stdout:         null,
+        stderr:         null,
+        compile_output: err.stderr || err.message || 'Compilation failed',
+        message:        null,
+        verdict:        'Compilation Error',
+        timeMs:         0,
+        ...memFields(0),
+      };
+    }
+
     return {
       stdout:         err.stdout  || null,
       stderr:         err.stderr  || err.message || null,
